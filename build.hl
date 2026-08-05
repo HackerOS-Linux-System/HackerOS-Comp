@@ -1,0 +1,4 @@
+// cargo
+// rustc
+
+> cargo build --release
