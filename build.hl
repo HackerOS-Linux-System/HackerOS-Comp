@@ -2,3 +2,8 @@
 // rustc
 
 > cargo build --release
+;; install mising
+;; > sudo apt install libudev-dev 
+;; > sudo apt install libseat-dev
+;; > sudo apt install libinput-dev 
+;; > sudo apt install libgbm-dev
