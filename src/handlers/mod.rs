@@ -1,0 +1,9 @@
+pub mod compositor;
+pub mod data_device;
+pub mod decoration;
+pub mod layer_shell;
+pub mod output;
+pub mod seat;
+pub mod xdg_shell;
+#[cfg(feature = "xwayland")]
+pub mod xwayland_shell;
