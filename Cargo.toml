@@ -1,19 +1,23 @@
 [package]
 name = "comphwde"
-description = "HWDE Wayland/XWayland compositor (Smithay-based)"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-license.workspace = true
-repository.workspace = true
-rust-version.workspace = true
+description = "HWDE Wayland/XWayland compositor (Smithay-based), extended with --extern-sde, --extern-hacker-mode."
+version = "0.0.1"
+edition = "2021"
+authors = ["HackerOS Team <hackeros068@gmail.com>"]
+license = "GPL-3.0"
+repository = "https://github.com/HackerOS-Linux-System/HWDE/"
+rust-version = "1.80"
 
 [[bin]]
 name = "comphwde"
 path = "src/main.rs"
 
 [dependencies]
-hwde-ipc = { path = "../ipc" }
+hwde-ipc = { path = "sde/ipc" }
+# Own-from-scratch protocol used only in `--extern-sde` mode (see
+# src/extern_ipc.rs and the sde-ipc crate's module docs). Independent of
+# hwde-ipc on purpose - SDE is a native Slint shell, not a Tauri webview.
+sde-ipc = { path = "sde/sde-ipc" }
 anyhow = "1"
 bitflags = "2.6"
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -66,3 +70,27 @@ drm-experimental = [
     "smithay/backend_gbm",
     "smithay/renderer_multi",
 ]
+
+# This manifest is both `comphwde`'s own [package] *and* the workspace
+# root - a "mixed manifest", one of the two ways Cargo lets a root
+# crate's Cargo.toml double as its workspace's. `comphwde` itself is an
+# implicit workspace member (it's the package defined right here);
+# `members` below only needs to list the two path-dependency crates that
+# live under `sde/`, which otherwise wouldn't be part of the workspace at
+# all.
+[workspace]
+resolver = "2"
+members = [
+    "sde/ipc",
+    "sde/sde-ipc",
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+strip = true
+
+[profile.dev]
+opt-level = 0
