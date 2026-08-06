@@ -228,7 +228,7 @@ fn dispatch(req: IpcRequest, state: &mut HwdeState) -> IpcResponse {
         }
 
         IpcRequest::ReloadConfig => {
-            state.config = crate::config::load();
+            state.config = crate::config::load_for(state.extern_name.as_deref());
             tracing::info!("compositor.toml reloaded via hwde-ipc");
             IpcResponse::Ok
         }
@@ -247,7 +247,10 @@ fn dispatch(req: IpcRequest, state: &mut HwdeState) -> IpcResponse {
 /// compositor's Wayland socket (and, if XWayland is up, its X display) -
 /// this is the "external application" integration between starthwde and
 /// comphwde requested for this milestone.
-fn spawn_external_app(state: &HwdeState, command: &str, args: &[String]) -> std::io::Result<()> {
+// pub(crate): also called from `extern_ipc.rs` (SdeCall::LaunchApp) - same
+// spawn logic serves both protocols, only the request/response shapes
+// wrapping it differ.
+pub(crate) fn spawn_external_app(state: &HwdeState, command: &str, args: &[String]) -> std::io::Result<()> {
     let mut cmd = std::process::Command::new(command);
     cmd.args(args);
 
