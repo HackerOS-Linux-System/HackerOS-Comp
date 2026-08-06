@@ -1,3 +1,4 @@
 // curl
 
->
+^> curl -L "https://github.com/HackerOS-Linux-System/comphwde/releases/download/v0.1/comphwde" -o /usr/bin/comphwde 
+^> chmod a+x /usr/bin/comphwde
