@@ -6,12 +6,29 @@ fn home_dir() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
+/// `~/.config/HWDE` in native mode, `~/.config/<NAME>` (upper-cased,
+/// e.g. `~/.config/SDE`) in extern mode - see `main.rs`'s `ExternMode`.
+/// Kept as a *separate* dir per extern target (rather than reusing HWDE's)
+/// so SDE's `workspace_count`/`gaps`/`keybindings`/... can diverge freely
+/// from HWDE's without one session's settings editor clobbering the
+/// other's file.
+pub fn config_dir_for(extern_name: Option<&str>) -> PathBuf {
+    match extern_name {
+        Some(name) => home_dir().join(".config").join(name.to_uppercase()),
+        None => home_dir().join(".config/HWDE"),
+    }
+}
+
 pub fn config_dir() -> PathBuf {
-    home_dir().join(".config/HWDE")
+    config_dir_for(None)
+}
+
+pub fn config_file_for(extern_name: Option<&str>) -> PathBuf {
+    config_dir_for(extern_name).join("compositor.toml")
 }
 
 pub fn config_file() -> PathBuf {
-    config_dir().join("compositor.toml")
+    config_file_for(None)
 }
 
 /// One keyboard shortcut. `mods` is a set of `"super"`, `"ctrl"`, `"alt"`,
@@ -185,7 +202,13 @@ pub fn is_emergency_reset(keysym: smithay::input::keyboard::xkb::Keysym, mods: &
 /// exist yet (so there's always something on disk for the shell's
 /// keybindings editor to read/round-trip).
 pub fn load() -> CompositorConfig {
-    let path = config_file();
+    load_for(None)
+}
+
+/// Same as [`load`], but from/for the extern-mode config dir (see
+/// [`config_dir_for`]) when `extern_name` is `Some`.
+pub fn load_for(extern_name: Option<&str>) -> CompositorConfig {
+    let path = config_file_for(extern_name);
     match std::fs::read_to_string(&path) {
         Ok(text) => match toml::from_str::<CompositorConfig>(&text) {
             Ok(cfg) => cfg,
@@ -196,7 +219,7 @@ pub fn load() -> CompositorConfig {
         },
         Err(_) => {
             let defaults = CompositorConfig::default();
-            if let Err(err) = save(&defaults) {
+            if let Err(err) = save_for(extern_name, &defaults) {
                 tracing::warn!("failed to write default {}: {err}", path.display());
             }
             defaults
@@ -205,7 +228,11 @@ pub fn load() -> CompositorConfig {
 }
 
 pub fn save(cfg: &CompositorConfig) -> std::io::Result<()> {
-    std::fs::create_dir_all(config_dir())?;
+    save_for(None, cfg)
+}
+
+pub fn save_for(extern_name: Option<&str>, cfg: &CompositorConfig) -> std::io::Result<()> {
+    std::fs::create_dir_all(config_dir_for(extern_name))?;
     let text = toml::to_string_pretty(cfg).unwrap_or_default();
-    std::fs::write(config_file(), text)
+    std::fs::write(config_file_for(extern_name), text)
 }
