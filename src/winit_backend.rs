@@ -29,7 +29,7 @@ use crate::wallpaper::Wallpaper;
 
 pub const OUTPUT_NAME: &str = "HWDE-1";
 
-pub fn run(wallpaper_path: std::path::PathBuf) -> anyhow::Result<()> {
+pub fn run(wallpaper_path: std::path::PathBuf, extern_mode: Option<crate::ExternMode>) -> anyhow::Result<()> {
     let mut event_loop: EventLoop<HwdeState> = EventLoop::try_new()?;
     let display: Display<HwdeState> = Display::new()?;
     let display_handle = display.handle();
@@ -37,14 +37,23 @@ pub fn run(wallpaper_path: std::path::PathBuf) -> anyhow::Result<()> {
     let (mut backend, mut winit_input) = winit::init::<GlesRenderer>()
         .map_err(|e| anyhow::anyhow!("failed to initialize winit backend: {e}"))?;
 
+    // Native mode keeps the historical "HWDE-1" output name / "HWDE" make
+    // string; extern mode uses the extern target's own name (e.g.
+    // "SDE-1" / "SDE") so tooling that reads these (e.g. `wlr-randr`,
+    // debugging output) doesn't say "HWDE" while actually running SDE.
+    let (output_name, output_make) = match &extern_mode {
+        Some(mode) => (format!("{}-1", mode.name.to_uppercase()), mode.name.to_uppercase()),
+        None => (OUTPUT_NAME.to_string(), "HWDE".to_string()),
+    };
+
     let size = backend.window_size();
     let mode = Mode { size, refresh: 60_000 };
     let output = Output::new(
-        OUTPUT_NAME.to_string(),
+        output_name,
         PhysicalProperties {
             size: (0, 0).into(),
             subpixel: Subpixel::Unknown,
-            make: "HWDE".into(),
+            make: output_make,
             model: "comphwde-winit".into(),
         },
     );
@@ -130,11 +139,13 @@ pub fn run(wallpaper_path: std::path::PathBuf) -> anyhow::Result<()> {
         wallpaper,
         pending_wallpaper_reload: false,
         socket_name: Some(socket_name),
-        config: crate::config::load(),
+        config: crate::config::load_for(extern_mode.as_ref().map(|m| m.name.as_str())),
         active_workspace: 0,
         focused_window: None,
         tiling_enabled: std::collections::HashSet::new(),
         floating_windows: std::collections::HashSet::new(),
+        pinned_surfaces: std::collections::HashMap::new(),
+        extern_name: extern_mode.as_ref().map(|m| m.name.clone()),
         #[cfg(feature = "xwayland")]
         xwm: None,
         #[cfg(feature = "xwayland")]
@@ -146,7 +157,12 @@ pub fn run(wallpaper_path: std::path::PathBuf) -> anyhow::Result<()> {
     state.space.map_output(&output, (0, 0));
     state.shm_state.update_formats(backend.renderer().shm_formats());
 
-    crate::ipc::init(&event_loop.handle())?;
+    match &extern_mode {
+        // Extern mode speaks sde-ipc (its own protocol - see that crate's
+        // module docs) instead of hwde-ipc.
+        Some(mode) => crate::extern_ipc::init(&event_loop.handle(), mode.name.clone())?,
+        None => crate::ipc::init(&event_loop.handle())?,
+    }
 
     #[cfg(feature = "xwayland")]
     if let Err(err) = crate::xwayland::start(&mut state) {
