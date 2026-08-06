@@ -57,6 +57,18 @@ pub struct ManagedWindow {
     pub saved_workspace_location: Option<Point<i32, Logical>>,
 }
 
+/// Which screen edge a *pinned* shell surface (an extern-mode shell's
+/// panel/dock, registered via `sde-ipc`'s `SdeCall::PinSurface`) is
+/// anchored to. Mirrors `sde_ipc::PinnedEdge` (this crate doesn't depend
+/// on `sde-ipc` for the plain `hwde-ipc`/native-mode build path, so it's
+/// a small local copy rather than a re-export - see `extern_ipc.rs` for
+/// the conversion at the one boundary that needs it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinnedEdge {
+    Top,
+    Bottom,
+}
+
 /// Top-level compositor state, analogous to `AnvilState` in Smithay's
 /// reference compositor but scoped to what HWDE needs.
 pub struct HwdeState {
@@ -116,6 +128,20 @@ pub struct HwdeState {
     /// same workspace continues to tile normally.
     pub floating_windows: std::collections::HashSet<u64>,
 
+    /// `app_id -> (edge, thickness_px)` for shell surfaces registered via
+    /// `SdeCall::PinSurface` (extern mode only; empty and unused in native
+    /// HWDE mode) - e.g. SDE's top panel and bottom dock. A window whose
+    /// `app_id` is a key here is pinned to that screen edge instead of
+    /// being placed/tiled like a normal window - see `place_new_window`
+    /// and `pin_surface`.
+    pub pinned_surfaces: std::collections::HashMap<String, (PinnedEdge, u32)>,
+    /// `None` in native HWDE mode, `Some("sde")` (etc) in extern mode -
+    /// see `main.rs`'s `ExternMode`. Threaded through to `config.rs` so a
+    /// `ReloadConfig` request (from either `ipc.rs` or `extern_ipc.rs`, or
+    /// the `reload_config` keybinding action) re-reads the *right*
+    /// `compositor.toml`.
+    pub extern_name: Option<String>,
+
     #[cfg(feature = "xwayland")]
     pub xwm: Option<smithay::xwayland::X11Wm>,
     #[cfg(feature = "xwayland")]
@@ -137,12 +163,36 @@ impl HwdeState {
     /// consistent whether an app is a Wayland/X11 client or an in-shell app,
     /// and registers it in `windows` with a fresh id.
     pub fn place_new_window(&mut self, window: &Window, activate: bool) -> u64 {
+        let id = self.next_window_id;
+        self.next_window_id += 1;
+
+        let app_id = window.toplevel().map(with_app_id).unwrap_or_default();
+        if let Some(&(edge, thickness)) = self.pinned_surfaces.get(&app_id) {
+            // A registered shell surface (panel/dock): pinned to its edge,
+            // full output width, never cascaded and never tiled - see
+            // `pin_geometry`/`pin_surface`.
+            let geo = self.pin_geometry(edge, thickness);
+            request_size(window, geo.size);
+            self.space.map_element(window.clone(), geo.loc, activate);
+            self.windows.push(ManagedWindow {
+                id,
+                window: window.clone(),
+                is_minimized: false,
+                is_maximized: false,
+                is_ssd: false,
+                saved_geometry: None,
+                workspace: self.active_workspace,
+                saved_workspace_location: None,
+            });
+            self.floating_windows.insert(id);
+            self.space.raise_element(window, true);
+            return id;
+        }
+
         let count = self.space.elements().count() as i32;
         let loc = (80 + count * 24, 60 + count * 24);
         self.space.map_element(window.clone(), loc, activate);
 
-        let id = self.next_window_id;
-        self.next_window_id += 1;
         self.windows.push(ManagedWindow {
             id,
             window: window.clone(),
@@ -156,6 +206,47 @@ impl HwdeState {
         self.floating_windows.remove(&id); // ids are never reused, but keep this invariant explicit
         self.apply_tiling_layout();
         id
+    }
+
+    /// Computes the pinned rectangle (full output width, `thickness_px`
+    /// tall, flush against `edge`) for a registered shell surface. Public
+    /// (crate-visible) so `extern_ipc.rs` can call it too when it needs to
+    /// reposition a surface that was already mapped *before*
+    /// `SdeCall::PinSurface` registered it - see `pin_surface`.
+    pub(crate) fn pin_geometry(&self, edge: PinnedEdge, thickness: u32) -> Rectangle<i32, Logical> {
+        let output = self.primary_output_geometry();
+        let thickness = thickness as i32;
+        match edge {
+            PinnedEdge::Top => Rectangle::new(output.loc, (output.size.w, thickness).into()),
+            PinnedEdge::Bottom => Rectangle::new(
+                (output.loc.x, output.loc.y + output.size.h - thickness).into(),
+                (output.size.w, thickness).into(),
+            ),
+        }
+    }
+
+    /// Registers (or updates) `app_id` as pinned to `edge` at `thickness_px`
+    /// - see `SdeCall::PinSurface`. Repositions any already-mapped window
+    /// with that `app_id` immediately (rather than waiting for it to be
+    /// remapped), so call order between "launch the panel" and "pin the
+    /// panel" doesn't matter to SDE's startup sequencing.
+    pub fn pin_surface(&mut self, app_id: String, edge: PinnedEdge, thickness: u32) {
+        self.pinned_surfaces.insert(app_id.clone(), (edge, thickness));
+
+        let matches: Vec<(u64, Window)> = self
+            .windows
+            .iter()
+            .filter(|w| w.window.toplevel().map(with_app_id).unwrap_or_default() == app_id)
+            .map(|w| (w.id, w.window.clone()))
+            .collect();
+        for (id, window) in matches {
+            let geo = self.pin_geometry(edge, thickness);
+            request_size(&window, geo.size);
+            self.space.map_element(window.clone(), geo.loc, false);
+            self.floating_windows.insert(id);
+            self.space.raise_element(&window, true);
+        }
+        self.apply_tiling_layout();
     }
 
     /// Hides every window on the current workspace and shows every
@@ -321,7 +412,7 @@ impl HwdeState {
             }
             Action::ReloadConfig => {
                 tracing::info!("keybinding: reloading compositor.toml");
-                self.config = crate::config::load();
+                self.config = crate::config::load_for(self.extern_name.as_deref());
             }
             Action::SwitchWorkspace(n) => self.switch_workspace(n.saturating_sub(1)),
             Action::MoveToWorkspace(n) => {
@@ -745,6 +836,29 @@ impl HwdeState {
             .collect()
     }
 
+    /// `sde-ipc`'s equivalent of [`window_summaries`] - a separate method
+    /// (rather than converting the `hwde_ipc::WindowSummary`s above)
+    /// because `sde_ipc::SdeWindowInfo` additionally carries `workspace`
+    /// and `focused`, which `hwde_ipc::WindowSummary` doesn't have (SDE's
+    /// panel/dock show per-window workspace + focus state; HWDE's shell
+    /// gets that from `ListWorkspaces`/its own focus tracking instead).
+    /// Used only from `extern_ipc.rs`.
+    pub fn sde_window_summaries(&self) -> Vec<sde_ipc::SdeWindowInfo> {
+        self.windows
+            .iter()
+            .map(|managed| sde_ipc::SdeWindowInfo {
+                id: managed.id,
+                title: managed.window.toplevel().map(with_title).unwrap_or_default(),
+                app_id: managed.window.toplevel().map(with_app_id).unwrap_or_default(),
+                workspace: managed.workspace,
+                focused: self.focused_window == Some(managed.id),
+                minimized: managed.is_minimized,
+                maximized: managed.is_maximized,
+                floating: self.floating_windows.contains(&managed.id),
+            })
+            .collect()
+    }
+
     /// Answers `IpcRequest::ListOutputs` (v0.2 addition) - every output
     /// currently mapped into `self.space`, in the shape the shell's
     /// "Wyświetlacze" settings section needs for a real multi-monitor
@@ -778,7 +892,7 @@ impl HwdeState {
     }
 }
 
-fn with_title(t: &ToplevelSurface) -> String {
+pub(crate) fn with_title(t: &ToplevelSurface) -> String {
     smithay::wayland::compositor::with_states(t.wl_surface(), |states| {
         states
             .data_map
@@ -788,7 +902,7 @@ fn with_title(t: &ToplevelSurface) -> String {
     })
 }
 
-fn with_app_id(t: &ToplevelSurface) -> String {
+pub(crate) fn with_app_id(t: &ToplevelSurface) -> String {
     smithay::wayland::compositor::with_states(t.wl_surface(), |states| {
         states
             .data_map
@@ -796,4 +910,16 @@ fn with_app_id(t: &ToplevelSurface) -> String {
             .map(|d| d.lock().unwrap().app_id.clone().unwrap_or_default())
             .unwrap_or_default()
     })
+}
+
+/// Sends a configure requesting `size` for `window`'s toplevel, if it has
+/// one (X11/XWayland windows are sized differently and never get pinned in
+/// practice - see `place_new_window` - so the no-op fallback there is
+/// fine). Used to size pinned shell surfaces (panel/dock) to their full
+/// pinned rectangle rather than whatever size the client itself requested.
+fn request_size(window: &Window, size: smithay::utils::Size<i32, Logical>) {
+    if let smithay::desktop::WindowSurface::Wayland(toplevel) = window.underlying_surface() {
+        toplevel.with_pending_state(|state| state.size = Some(size));
+        toplevel.send_pending_configure();
+    }
 }
