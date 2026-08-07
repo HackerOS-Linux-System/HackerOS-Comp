@@ -1,6 +1,6 @@
 # comphwde
 
-Smithay-based Wayland/XWayland compositor for HWDE.
+Smithay-based Wayland/XWayland compositor for HackerOS.
 
 ## Modules
 
