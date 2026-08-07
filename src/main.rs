@@ -34,9 +34,15 @@ mod backend_drm;
 ///   having to implement a Wayland compositor from scratch.
 ///
 ///   SDE's session launcher (`startsde`) always runs `comphwde
-///   --extern-sde`; nothing else is expected to pass a different `<name>`
-///   today, but the mechanism isn't hardcoded to "sde" so it doesn't have
-///   to be re-plumbed if that ever changes.
+///   --extern-sde`; Hacker Mode's session launcher
+///   (`hacker-mode-session`, in the Hacker-Mode repo) always runs
+///   `comphwde --extern-hacker-mode` the same way, via its own vendored
+///   `hacker-mode-ipc` crate (a thin wrapper around the same protocol
+///   `sde-ipc` implements - see `hacker-mode/` in this workspace for a
+///   reference copy, and that crate's module docs for why Hacker Mode
+///   vendors its own separate copy rather than depending on this
+///   repository). The mechanism isn't hardcoded to either name, so a
+///   third extern target doesn't need any changes here either.
 ///
 /// Native and extern mode are mutually exclusive for a given comphwde
 /// process - you get one or the other, never both - so there is exactly
