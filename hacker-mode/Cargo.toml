@@ -1,1 +1,14 @@
+[package]
+name = "hacker-mode-ipc"
+version = "0.1.0"
+edition = "2021"
+description = "Reference copy, within the comphwde/HWDE workspace, of the client side of the --extern-hacker-mode wire protocol (identical to sde-ipc's protocol - see this crate's module docs). Not linked into the comphwde binary; kept here purely as workspace-local documentation and a target for this workspace's own protocol tests. Hacker Mode's actually shipped binaries (the Tauri shell and its hacker-mode-ipcctl helper) vendor their own separate, standalone copy of this crate in their own repository instead of depending on this one - see the module docs below for why."
+license = "GPL-3.0"
 
+[dependencies]
+# Same generic extern-mode protocol/transport every `--extern-<name>`
+# target speaks - see this crate's module docs for why we depend on it
+# instead of duplicating it here.
+sde-ipc = { path = "../sde/ipc" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
