@@ -13,11 +13,22 @@ name = "comphwde"
 path = "src/main.rs"
 
 [dependencies]
-hwde-ipc = { path = "sde/ipc" }
-# Own-from-scratch protocol used only in `--extern-sde` mode (see
+hwde-ipc = { path = "sde" }
+# Own-from-scratch protocol used only in `--extern-<name>` mode (see
 # src/extern_ipc.rs and the sde-ipc crate's module docs). Independent of
 # hwde-ipc on purpose - SDE is a native Slint shell, not a Tauri webview.
-sde-ipc = { path = "sde/sde-ipc" }
+# Every `--extern-<name>` target (sde, hacker-mode, ...) speaks this same
+# wire protocol on its own socket; only the socket name differs (see
+# `sde_ipc::socket_path_for`). See `hacker-mode/` in this same workspace
+# for that target's own reference copy of the client side of this
+# protocol - the `[[bin]] comphwde` built from THIS package does not
+# depend on it (`extern_ipc.rs` only implements the *server* side,
+# generically, for any `--extern-<name>`); it's a workspace-local sibling
+# crate, not something this binary links against. See
+# `hacker-mode/src/lib.rs`'s module docs for why Hacker Mode's actually
+# shipped binaries use their own, separately-vendored copy of it instead
+# of depending on this one.
+sde-ipc = { path = "sde/ipc" }
 anyhow = "1"
 bitflags = "2.6"
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -81,8 +92,9 @@ drm-experimental = [
 [workspace]
 resolver = "2"
 members = [
+    "sde",
     "sde/ipc",
-    "sde/sde-ipc",
+    "hacker-mode",
 ]
 
 [profile.release]
