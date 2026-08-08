@@ -9,7 +9,42 @@ use smithay::desktop::Window;
 use smithay::output::Output;
 use smithay::utils::{Physical, Point, Rectangle};
 
-use crate::state::HwdeState;
+use crate::config::CompositorConfig;
+use crate::state::{HwdeState, ManagedWindow};
+use crate::wallpaper::Wallpaper;
+
+/// Just the pieces of [`HwdeState`] that `build_output_elements` (and the
+/// two private helpers it calls) actually read.
+///
+/// This exists so the DRM backend (`backend_drm.rs`) can call
+/// `build_output_elements` while its `GlesRenderer` is itself a field of
+/// `HwdeState` (inside `drm_gpus`). Taking `&HwdeState` wholesale there
+/// would alias the `&mut GlesRenderer` borrowed from the same struct -
+/// the borrow checker rejects that even though the fields involved are
+/// disjoint. Building a `RenderInputs` from individually-borrowed fields
+/// (`let HwdeState { ref space, ref mut drm_gpus, .. } = *state;`) sidesteps
+/// it. The winit backend's renderer isn't a field of `HwdeState` at all, so
+/// it just uses the `From<&HwdeState>` impl below and this is invisible to
+/// it.
+pub struct RenderInputs<'a> {
+    pub windows: &'a [ManagedWindow],
+    pub space: &'a smithay::desktop::Space<Window>,
+    pub config: &'a CompositorConfig,
+    pub focused_window: Option<u64>,
+    pub wallpaper: &'a Wallpaper,
+}
+
+impl<'a> From<&'a HwdeState> for RenderInputs<'a> {
+    fn from(state: &'a HwdeState) -> Self {
+        RenderInputs {
+            windows: &state.windows,
+            space: &state.space,
+            config: &state.config,
+            focused_window: state.focused_window,
+            wallpaper: &state.wallpaper,
+        }
+    }
+}
 
 // NOTE on the two things that were wrong here before:
 //
@@ -93,14 +128,14 @@ pub fn ssd_hit_test(state: &HwdeState, pos: Point<f64, smithay::utils::Logical>)
 
 /// Builds the decoration elements (grab bar + close button) for every
 /// mapped, non-minimized window that has `is_ssd` set.
-fn decoration_elements(state: &HwdeState, scale: f64) -> Vec<SolidColorRenderElement> {
+fn decoration_elements(inputs: &RenderInputs, scale: f64) -> Vec<SolidColorRenderElement> {
     let mut elements = Vec::new();
 
-    for managed in &state.windows {
+    for managed in inputs.windows {
         if !managed.is_ssd || managed.is_minimized {
             continue;
         }
-        let Some(loc) = state.space.element_location(&managed.window) else { continue };
+        let Some(loc) = inputs.space.element_location(&managed.window) else { continue };
         let width = managed.window.geometry().size.w;
         let bar = ssd_bar_geometry(loc, width);
 
@@ -147,17 +182,17 @@ fn decoration_elements(state: &HwdeState, scale: f64) -> Vec<SolidColorRenderEle
 /// already uses for the SSD grab bar. Skipped entirely for a minimized
 /// focused window (nothing to frame) or when tiling/floating leaves no
 /// focus at all.
-fn focus_border_elements(state: &HwdeState, scale: f64) -> Vec<SolidColorRenderElement> {
-    let border_width = state.config.border_width;
+fn focus_border_elements(inputs: &RenderInputs, scale: f64) -> Vec<SolidColorRenderElement> {
+    let border_width = inputs.config.border_width;
     if border_width <= 0 {
         return Vec::new();
     }
-    let Some(id) = state.focused_window else { return Vec::new() };
-    let Some(managed) = state.windows.iter().find(|w| w.id == id) else { return Vec::new() };
+    let Some(id) = inputs.focused_window else { return Vec::new() };
+    let Some(managed) = inputs.windows.iter().find(|w| w.id == id) else { return Vec::new() };
     if managed.is_minimized {
         return Vec::new();
     }
-    let Some(loc) = state.space.element_location(&managed.window) else { return Vec::new() };
+    let Some(loc) = inputs.space.element_location(&managed.window) else { return Vec::new() };
     let size = managed.window.geometry().size;
 
     let to_physical = |r: Rectangle<i32, smithay::utils::Logical>| -> Rectangle<i32, Physical> {
@@ -201,7 +236,7 @@ fn focus_border_elements(state: &HwdeState, scale: f64) -> Vec<SolidColorRenderE
 
 /// Assembles the full, correctly-ordered element list for one output.
 pub fn build_output_elements(
-    state: &HwdeState,
+    inputs: RenderInputs,
     renderer: &mut GlesRenderer,
     output: &Output,
     output_size: (i32, i32),
@@ -212,15 +247,15 @@ pub fn build_output_elements(
     // 1a. Focused-window border - frontmost of all (drawn last, in front
     //     of even the SSD grab bar, since it should always read as "on
     //     top" of the window it's framing).
-    elements.extend(focus_border_elements(state, scale).into_iter().map(OutputRenderElement::Decoration));
+    elements.extend(focus_border_elements(&inputs, scale).into_iter().map(OutputRenderElement::Decoration));
 
     // 1b. Decorations - grab bar/close button.
-    elements.extend(decoration_elements(state, scale).into_iter().map(OutputRenderElement::Decoration));
+    elements.extend(decoration_elements(&inputs, scale).into_iter().map(OutputRenderElement::Decoration));
 
     // 2. Windows + all layer-shell layers (space_render_elements already
     //    interleaves Top/Overlay before, and Background/Bottom after, the
     //    window stack itself).
-    match space_render_elements::<_, Window, _>(renderer, [&state.space], output, 1.0) {
+    match space_render_elements::<_, Window, _>(renderer, [inputs.space], output, 1.0) {
         Ok(space_elements) => {
             elements.extend(space_elements.into_iter().map(OutputRenderElement::Space));
         }
@@ -230,7 +265,7 @@ pub fn build_output_elements(
     }
 
     // 3. Wallpaper - backmost (drawn first).
-    if let Some(wallpaper) = state.wallpaper.render_element(output_size) {
+    if let Some(wallpaper) = inputs.wallpaper.render_element(output_size) {
         elements.push(OutputRenderElement::Wallpaper(wallpaper));
     }
 
