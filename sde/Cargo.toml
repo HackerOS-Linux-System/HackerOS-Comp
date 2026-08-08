@@ -1,4 +1,4 @@
-package]
+[package]
 name = "hwde-ipc"
 version = "1.0.0"
 edition = "2021"
