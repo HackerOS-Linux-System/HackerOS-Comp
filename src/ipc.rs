@@ -81,7 +81,7 @@ pub fn init(handle: &LoopHandle<'static, HwdeState>) -> std::io::Result<()> {
 /// `hwde-ipc::runtime_dir` already uses) rather than pulling in a `libc`
 /// dependency just for this.
 #[cfg(unix)]
-fn our_uid() -> u32 {
+pub(crate) fn our_uid() -> u32 {
     unsafe {
         extern "C" {
             fn getuid() -> u32;
@@ -91,7 +91,7 @@ fn our_uid() -> u32 {
 }
 
 #[cfg(not(unix))]
-fn our_uid() -> u32 {
+pub(crate) fn our_uid() -> u32 {
     0
 }
 
@@ -100,7 +100,7 @@ fn our_uid() -> u32 {
 /// usage elsewhere). Returns `None` if that can't be determined, which
 /// callers must treat as "reject", not "assume trusted".
 #[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> Option<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> Option<u32> {
     #[repr(C)]
     struct Ucred {
         pid: i32,
@@ -132,7 +132,7 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn peer_uid(_stream: &UnixStream) -> Option<u32> {
+pub(crate) fn peer_uid(_stream: &UnixStream) -> Option<u32> {
     None
 }
 
