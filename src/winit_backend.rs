@@ -152,12 +152,20 @@ pub fn run(wallpaper_path: std::path::PathBuf, extern_mode: Option<crate::Extern
         xdisplay: None,
         #[cfg(feature = "xwayland")]
         xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState::new::<HwdeState>(&dh),
+        #[cfg(feature = "drm-experimental")]
+        drm_gpus: std::collections::HashMap::new(),
     };
 
     state.space.map_output(&output, (0, 0));
     state.shm_state.update_formats(backend.renderer().shm_formats());
 
     match &extern_mode {
+        // HackerLand is a distinct identity with its own protocol (see
+        // hackerland_ipc.rs's module doc), not another --extern-<n> target
+        // speaking sde-ipc - route it separately even though it also
+        // arrives here as an ExternMode (reused purely for config/wallpaper
+        // namespacing, same as any other extern target).
+        Some(mode) if mode.name == "hackerland" => crate::hackerland_ipc::init(&event_loop.handle())?,
         // Extern mode speaks sde-ipc (its own protocol - see that crate's
         // module docs) instead of hwde-ipc.
         Some(mode) => crate::extern_ipc::init(&event_loop.handle(), mode.name.clone())?,
@@ -199,7 +207,7 @@ pub fn run(wallpaper_path: std::path::PathBuf, extern_mode: Option<crate::Extern
         let size = backend.window_size();
         let (renderer, mut framebuffer) = backend.bind()?;
 
-        let elements = crate::render_elements::build_output_elements(&state, renderer, &output, (size.w, size.h));
+        let elements = crate::render_elements::build_output_elements((&state).into(), renderer, &output, (size.w, size.h));
 
         let render_result =
             damage_tracker.render_output(renderer, &mut framebuffer, 0, &elements, Color32F::new(0.05, 0.05, 0.08, 1.0));
