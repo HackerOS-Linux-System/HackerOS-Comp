@@ -227,7 +227,7 @@ fn dispatch(call: SdeCall, state: &mut HwdeState) -> SdeOutcome {
         },
 
         SdeCall::SetWallpaper { path } => {
-            state.wallpaper.set_path(path.into());
+            state.wallpaper.set_path(path);
             state.pending_wallpaper_reload = true;
             ok(SdeResult::None)
         }
