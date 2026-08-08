@@ -5,7 +5,7 @@ version = "0.0.1"
 edition = "2021"
 authors = ["HackerOS Team <hackeros068@gmail.com>"]
 license = "GPL-3.0"
-repository = "https://github.com/HackerOS-Linux-System/HWDE/"
+repository = "https://github.com/HackerOS-Linux-System/comphwde/"
 rust-version = "1.80"
 
 [[bin]]
@@ -29,6 +29,13 @@ hwde-ipc = { path = "sde" }
 # shipped binaries use their own, separately-vendored copy of it instead
 # of depending on this one.
 sde-ipc = { path = "sde/ipc" }
+# HackerLand: comphwde's own window manager identity/protocol, exposed as
+# the `comphwde wm` subcommand - see wm/Cargo.toml's description (the
+# crate is named `hackerland`; it lives in this repo's `wm/` directory).
+# main.rs calls `hackerland::run()` for the CLI-client half
+# (`comphwde wm <subcommand>`); `src/hackerland_ipc.rs` is the server half
+# and depends on this crate too, for the shared wire-protocol types.
+hackerland = { path = "wm" }
 anyhow = "1"
 bitflags = "2.6"
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -64,15 +71,18 @@ default-features = false
 features = ["composite"]
 
 [features]
-default = ["xwayland"]
+default = ["xwayland", "drm-experimental"]
 # XWayland (Xorg compatibility) support - required for HackerOS's many
 # X11-only security/pentesting/gaming tools that don't speak Wayland yet.
 xwayland = []
-# Real (not just planned) DRM/udev/libseat/libinput backend for driving a
-# display from a bare TTY/SDDM login - see `backend_drm.rs`'s module doc
-# for exactly which parts are solid (session/device-discovery/input) vs.
-# still need hardware-in-the-loop iteration (the atomic KMS modeset +
-# render/pageflip core). Off by default; NOT wired into `main` yet.
+# Real DRM/udev/libseat/libinput backend for driving a display from a bare
+# TTY/SDDM login - see `backend_drm.rs`'s module doc. On by default (part
+# of `default` above) so a plain `cargo build --release` always includes
+# it; `main.rs` still only *activates* it at runtime when there's no
+# WAYLAND_DISPLAY/DISPLAY to nest inside of, so a normal desktop dev build
+# is unaffected either way. Disable explicitly with
+# `--no-default-features --features xwayland` if you need a build that
+# can't touch /dev/dri at all (e.g. a container without a DRM device).
 drm-experimental = [
     "smithay/backend_udev",
     "smithay/backend_session",
@@ -86,15 +96,18 @@ drm-experimental = [
 # root - a "mixed manifest", one of the two ways Cargo lets a root
 # crate's Cargo.toml double as its workspace's. `comphwde` itself is an
 # implicit workspace member (it's the package defined right here);
-# `members` below only needs to list the two path-dependency crates that
-# live under `sde/`, which otherwise wouldn't be part of the workspace at
-# all.
+# `members` below lists every other path-dependency crate that lives in
+# this repository (`sde/` + `sde/ipc`, `hacker-mode/`'s workspace-local
+# reference copy, and `wm/` for the `comphwde wm` subcommand), which
+# otherwise wouldn't be part of the workspace at all.
 [workspace]
 resolver = "2"
 members = [
     "sde",
     "sde/ipc",
     "hacker-mode",
+    "wm",
+    "cybersecurity-mode",
 ]
 
 [profile.release]
