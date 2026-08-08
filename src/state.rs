@@ -148,6 +148,20 @@ pub struct HwdeState {
     pub xdisplay: Option<u32>,
     #[cfg(feature = "xwayland")]
     pub xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
+
+    /// One entry per GPU that `backend_drm.rs`'s udev/DRM backend has
+    /// opened (almost always exactly one - the primary GPU - on typical
+    /// single-GPU laptops/desktops). Empty and unused when running under
+    /// `winit_backend.rs` instead. Lives on `HwdeState` itself (rather than
+    /// e.g. being threaded alongside it through the event loop) so it's
+    /// reachable as an ordinary field from *any* calloop callback that
+    /// already gets `&mut HwdeState` - the udev/libinput/per-device DRM
+    /// event sources all do. See `backend_drm.rs`'s module doc for why
+    /// rendering has to reach it via disjoint field-destructuring rather
+    /// than through `render_elements::RenderInputs`'s normal `&HwdeState`
+    /// path.
+    #[cfg(feature = "drm-experimental")]
+    pub drm_gpus: std::collections::HashMap<smithay::backend::drm::DrmNode, crate::backend_drm::GpuState>,
 }
 
 impl HwdeState {
