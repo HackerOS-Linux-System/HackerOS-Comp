@@ -1,1 +1,18 @@
+[package]
+name = "hackerland"
+version = "0.1.0"
+edition = "2021"
+description = "HackerLand: comphwde's own window manager identity and control protocol, in the spirit of Hyprland/Wayfire's own IPC (a plaintext `dispatch <action> [args...]` / query socket, distinct from the generic hwde-ipc/sde-ipc protocols comphwde also speaks). This crate defines the wire protocol (`protocol` module, shared with comphwde's own server-side src/hackerland_ipc.rs so the two can't drift apart) and implements the `comphwde wm` subcommand's client half: `comphwde wm` with no further arguments launches a HackerLand session; `comphwde wm <command> [args...]` instead sends one command to an already-running HackerLand session and prints the reply."
+license = "GPL-3.0"
 
+[dependencies]
+# Only used for `runtime_dir()` (where the socket lives) and the
+# WindowSummary/WorkspaceSummary/OutputSummary types HackerLand's `windows`
+# / `workspaces` / `outputs` queries reuse verbatim so there's exactly one
+# definition of "what a window/workspace/output looks like on the wire" in
+# this workspace, not a second copy that could drift from hwde-ipc's.
+# HackerLand's *command* protocol itself (this crate's `protocol` module)
+# is its own thing, not hwde-ipc's request/response envelope.
+hwde-ipc = { path = "../sde" }
+serde_json = "1"
+anyhow = "1"
