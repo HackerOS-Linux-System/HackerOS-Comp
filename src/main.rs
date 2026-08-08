@@ -2,6 +2,7 @@ mod config;
 mod extern_ipc;
 mod grabs;
 mod handlers;
+mod hackerland_ipc;
 mod input;
 mod ipc;
 mod render_elements;
@@ -10,10 +11,11 @@ mod wallpaper;
 mod winit_backend;
 #[cfg(feature = "xwayland")]
 mod xwayland;
-// Experimental, feature-gated, NOT wired into `main` yet - see its module
-// doc comment for exactly what's missing before this could drive a real
-// TTY/SDDM session. Kept compiling (behind a feature flag) so it doesn't
-// bit-rot while that work is planned.
+// Feature-gated real TTY/SDDM session backend (DRM/KMS + udev + libinput +
+// libseat), wired into `main()` below. Every call in it is checked against
+// Smithay 0.7.0 / drm-rs 0.14.1 source directly (see its module doc
+// comment), but hasn't been run against real hardware in this environment -
+// kept behind `drm-experimental` so a normal build is unaffected either way.
 #[cfg(feature = "drm-experimental")]
 mod backend_drm;
 
@@ -71,7 +73,30 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args: Vec<String> = std::env::args().collect();
-    let extern_mode = parse_extern_flag(&args);
+
+    // `comphwde wm ...`: HackerLand, comphwde's own window manager
+    // identity/protocol (see wm/src/lib.rs's module doc - the crate is
+    // named `hackerland`, living in this repo's `wm/` directory).
+    //
+    // * `comphwde wm` (nothing further) - launch a HackerLand session.
+    //   Falls straight through into the exact same startup path as native
+    //   HWDE mode / `--extern-<n>` mode below, just with `extern_mode`
+    //   forced to `hackerland` - same trick `--extern-<n>` already uses for
+    //   config/wallpaper namespacing, except the IPC branch in
+    //   winit_backend.rs/backend_drm.rs special-cases this name to install
+    //   `hackerland_ipc` (HackerLand's own protocol) instead of the
+    //   generic sde-ipc-based `extern_ipc`.
+    // * `comphwde wm <subcommand> [args...]` - control an *already
+    //   running* HackerLand session instead (list/focus/close windows,
+    //   switch workspaces, ...) and exit; never opens a display.
+    let extern_mode = if args.get(1).map(String::as_str) == Some("wm") {
+        if args.len() > 2 {
+            return hackerland::run(&args[2..]);
+        }
+        Some(ExternMode { name: "hackerland".to_string() })
+    } else {
+        parse_extern_flag(&args)
+    };
 
     // Wallpaper env var is namespaced the same way config/output are:
     // `HWDE_WALLPAPER` in native mode, `<NAME>_WALLPAPER` in extern mode
@@ -88,12 +113,33 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| std::path::PathBuf::from(wallpaper::DEFAULT_WALLPAPER));
 
     match &extern_mode {
+        Some(mode) if mode.name == "hackerland" => {
+            tracing::info!("HackerLand starting (wallpaper: {})", wallpaper_path.display())
+        }
         Some(mode) => tracing::info!(
             "comphwde starting in extern mode for '{}' (wallpaper: {})",
             mode.name,
             wallpaper_path.display()
         ),
         None => tracing::info!("comphwde starting (wallpaper: {})", wallpaper_path.display()),
+    }
+
+    #[cfg(feature = "drm-experimental")]
+    {
+        // Only take over the whole display from a bare TTY - if we're
+        // already inside someone else's Wayland or X11 session (the
+        // overwhelmingly common case during development: running comphwde
+        // from a terminal inside your regular desktop), grabbing every
+        // `/dev/dri` GPU and every input device out from under it via
+        // libseat would fight the session that's already running, not
+        // replace it. `winit_backend::run` (nested window) is what that
+        // situation wants instead, exactly as before this feature existed.
+        let nested = std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
+        if !nested {
+            tracing::info!("no WAYLAND_DISPLAY/DISPLAY set - starting the DRM/udev backend (real TTY session)");
+            return backend_drm::run_udev(wallpaper_path, extern_mode);
+        }
+        tracing::info!("WAYLAND_DISPLAY/DISPLAY set - running nested via winit instead of taking over the DRM/udev session");
     }
 
     winit_backend::run(wallpaper_path, extern_mode)
