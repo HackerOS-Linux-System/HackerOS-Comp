@@ -166,4 +166,82 @@ impl XwmHandler for HwdeState {
         let pointer = self.pointer.clone();
         pointer.set_grab(self, grab, smithay::utils::SERIAL_COUNTER.next_serial(), smithay::input::pointer::Focus::Clear);
     }
+
+    // Maximize/minimize - previously unhandled entirely (no override, so
+    // `XwmHandler`'s default no-op bodies silently swallowed every
+    // request), meaning an X11 app's own maximize button, its window
+    // menu's "Minimize", or a window manager hint sent via
+    // `_NET_WM_STATE`/`WM_CHANGE_STATE` had no effect at all under this
+    // compositor - the *Wayland*-native equivalents already worked (see
+    // `handlers/xdg_shell.rs`'s `maximize_request`/`unmaximize_request`),
+    // this was purely an XWayland-side gap. Reuses those exact same
+    // state functions (`maximize_window_by_id`, `minimize_window_by_id`,
+    // `unminimize_window_by_id`) rather than duplicating the maximize/
+    // minimize logic itself - an X11 window becoming "managed" already
+    // goes through the same `windows: Vec<ManagedWindow>`/
+    // `space: Space<Window>` machinery as a Wayland one (see
+    // `map_window_request` above using `place_new_window`, the same
+    // function `handlers/xdg_shell.rs::new_toplevel` uses), so there's
+    // nothing X11-specific left to do beyond finding the window's id and
+    // calling the same functions.
+    //
+    // `X11Surface::set_maximized`/`set_minimized` (the calls that tell
+    // the client "yes, your request was granted" and update its own
+    // `_NET_WM_STATE`) aren't called here - **unverified**: it wasn't
+    // confirmed which of `maximize_window_by_id` (state-side, moves/
+    // resizes the window) vs these `X11Surface` setters (client-request-
+    // side, updates what the client itself believes its state is) the
+    // client actually needs to see change to stop re-requesting: same
+    // caveat as the rest of this project (no `cargo check` available).
+    // If maximize/minimize visually works but an X11 app's own maximize
+    // button doesn't toggle to look "pressed", that's the missing half -
+    // a one-line addition per handler, once confirmed.
+    fn maximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let Some(surface) = window.wl_surface() else { return };
+        let Some(id) = self.window_id_for_surface(&surface) else { return };
+        let geo = self.primary_output_geometry();
+        self.maximize_window_by_id(id, true, geo);
+    }
+
+    fn unmaximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let Some(surface) = window.wl_surface() else { return };
+        let Some(id) = self.window_id_for_surface(&surface) else { return };
+        let geo = self.primary_output_geometry();
+        self.maximize_window_by_id(id, false, geo);
+    }
+
+    fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let Some(surface) = window.wl_surface() else { return };
+        let Some(id) = self.window_id_for_surface(&surface) else { return };
+        self.minimize_window_by_id(id);
+    }
+
+    fn unminimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let Some(surface) = window.wl_surface() else { return };
+        let Some(id) = self.window_id_for_surface(&surface) else { return };
+        self.unminimize_window_by_id(id);
+    }
+
+    // Same story as maximize/minimize above, but for fullscreen - see
+    // `fullscreen_window_by_id`'s doc comment in `state.rs`. `XwmHandler`
+    // apparently doesn't distinguish "fullscreen request" from
+    // "fullscreen-on-this-specific-output request" the way
+    // `handlers/xdg_shell.rs`'s Wayland-side `fullscreen_request` takes
+    // an `Option<Output>` for - X11's `_NET_WM_STATE_FULLSCREEN` has no
+    // per-output targeting concept in the protocol itself, so there's
+    // nothing extra to ignore here the way that Wayland-side `_output`
+    // parameter is.
+    fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let Some(surface) = window.wl_surface() else { return };
+        let Some(id) = self.window_id_for_surface(&surface) else { return };
+        let geo = self.primary_output_geometry();
+        self.fullscreen_window_by_id(id, true, geo);
+    }
+
+    fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let Some(surface) = window.wl_surface() else { return };
+        let Some(id) = self.window_id_for_surface(&surface) else { return };
+        let geo = self.primary_output_geometry();
+        self.fullscreen_window_by_id(id, false, geo);
+    }
 }
