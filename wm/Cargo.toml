@@ -13,6 +13,6 @@ license = "GPL-3.0"
 # this workspace, not a second copy that could drift from hwde-ipc's.
 # HackerLand's *command* protocol itself (this crate's `protocol` module)
 # is its own thing, not hwde-ipc's request/response envelope.
-hwde-ipc = { path = "../sde" }
+hwde-ipc = { path = "../hwde-ipc" }
 serde_json = "1"
 anyhow = "1"
