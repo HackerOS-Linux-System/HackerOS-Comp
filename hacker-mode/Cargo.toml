@@ -9,6 +9,6 @@ license = "GPL-3.0"
 # Same generic extern-mode protocol/transport every `--extern-<name>`
 # target speaks - see this crate's module docs for why we depend on it
 # instead of duplicating it here.
-sde-ipc = { path = "../sde/ipc" }
+sde-ipc = { path = "../sde" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
