@@ -132,5 +132,43 @@ impl XdgShellHandler for HwdeState {
             surface.send_configure();
         }
     }
+
+    // Fullscreen - previously entirely unhandled (no override at all,
+    // not even the "swallowed by the trait's default" situation
+    // maximize/minimize were in for X11 before `xwayland.rs` fixed that -
+    // this compositor had literally no fullscreen concept anywhere, not
+    // even a `ManagedWindow` field to track it in). See
+    // `fullscreen_window_by_id`'s doc comment in `state.rs` for the
+    // real behavior (and its one meaningful difference from maximize:
+    // hiding the SSD grab bar). `_output` (the client's optional
+    // preferred output for `set_fullscreen`) is intentionally unused -
+    // this compositor doesn't yet have a concept of "fullscreen on a
+    // specific requested output" vs. just "fullscreen on whichever
+    // output the window is already on" (`primary_output_geometry`) - see
+    // that function's own scope for the current single/primary-output
+    // assumption this inherits.
+    // `_output` type confirmed by the compiler (`E0053`) to be the raw
+    // `wl_output::WlOutput` protocol object, not Smithay's higher-level
+    // `Output` wrapper this file's other handlers work with - makes
+    // sense in hindsight: `xdg_toplevel.set_fullscreen`'s wire request
+    // carries a `wl_output` object reference directly (or null), before
+    // any Smithay-side resolution to its own `Output` type happens.
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>) {
+        if let Some(id) = self.window_id_for_surface(surface.wl_surface()) {
+            let geo = self.primary_output_geometry();
+            self.fullscreen_window_by_id(id, true, geo);
+        } else {
+            surface.send_configure();
+        }
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        if let Some(id) = self.window_id_for_surface(surface.wl_surface()) {
+            let geo = self.primary_output_geometry();
+            self.fullscreen_window_by_id(id, false, geo);
+        } else {
+            surface.send_configure();
+        }
+    }
 }
 delegate_xdg_shell!(HwdeState);
