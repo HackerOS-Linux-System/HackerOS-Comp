@@ -1,12 +1,15 @@
 mod config;
 mod extern_ipc;
+mod foreign_toplevel;
 mod grabs;
 mod handlers;
 mod hackerland_ipc;
 mod input;
 mod ipc;
 mod render_elements;
+mod sde_toplevel_ipc;
 mod state;
+mod title_text;
 mod wallpaper;
 mod winit_backend;
 #[cfg(feature = "xwayland")]
@@ -26,29 +29,55 @@ mod backend_drm;
 ///   HWDE's own compositor, speaking `hwde-ipc` to `starthwde`'s
 ///   Tauri/SolidJS frontend on `comphwde.sock`.
 /// * `comphwde --extern-<name>` - **extern mode**. comphwde still does all
-///   the actual Wayland/XWayland compositing, but now speaks `sde-ipc`
-///   (see that crate's module docs) on `comphwde-<name>.sock` instead,
-///   and namespaces its config/output/wallpaper-env under `<name>`
-///   (upper-cased) instead of `HWDE`. This is how a *different* desktop
-///   environment - SDE, a Slint shell, is the one shipped in this
-///   repository - reuses comphwde as its compositor without comphwde
-///   having to know anything about SDE specifically, and without SDE
-///   having to implement a Wayland compositor from scratch.
+///   the actual Wayland/XWayland compositing, but now namespaces its
+///   config/output/wallpaper-env under `<name>` (upper-cased) instead of
+///   `HWDE`, and speaks a control protocol appropriate to `<name>` instead
+///   of `hwde-ipc` - see "which protocol, for which target" below. This is
+///   how *other* desktop environments/shells - SDE (a Slint shell),
+///   Hacker Mode, Cybersecurity Mode (a Tauri/Solid.js shell; see
+///   `cybersec-mode/` in its own repository - it doesn't speak to a
+///   compositor at all yet, but is already wired up to run as
+///   `--extern-cybersecurity-mode` the same way the others do, ready for
+///   whenever it starts launching real Wayland/XWayland clients) - reuse
+///   comphwde as their compositor without comphwde having to know
+///   anything about any of them specifically beyond which protocol their
+///   `<name>` maps to, and without any of them having to implement a
+///   Wayland compositor from scratch.
 ///
-///   SDE's session launcher (`startsde`) always runs `comphwde
-///   --extern-sde`; Hacker Mode's session launcher
-///   (`hacker-mode-session`, in the Hacker-Mode repo) always runs
-///   `comphwde --extern-hacker-mode` the same way, via its own vendored
-///   `hacker-mode-ipc` crate (a thin wrapper around the same protocol
-///   `sde-ipc` implements - see `hacker-mode/` in this workspace for a
-///   reference copy, and that crate's module docs for why Hacker Mode
-///   vendors its own separate copy rather than depending on this
-///   repository). The mechanism isn't hardcoded to either name, so a
-///   third extern target doesn't need any changes here either.
+///   **Which protocol, for which target:**
+///
+///   - `--extern-sde` speaks `wlr-foreign-toplevel-management-unstable-v1`
+///     (see `foreign_toplevel.rs` and `sde_toplevel_ipc.rs`) for window
+///     listing/activation/close/minimize/maximize - a real,
+///     independently-specified Wayland protocol extension, bound directly
+///     by SDE's panel/dock on their existing Wayland connection, *not* a
+///     socket. `sde-ipc` (see below) keeps running for SDE too, since
+///     that protocol has no equivalent for wallpaper/workspaces/
+///     `PinSurface`/`LaunchApp`/`Shutdown`/`ReloadConfig` - see
+///     `sde_toplevel_ipc.rs`'s module doc for the full picture, and this
+///     project's "further work" notes for retiring `sde-ipc` for SDE
+///     entirely once those have a replacement too. SDE's session launcher
+///     (`startsde`) always runs `comphwde --extern-sde`.
+///   - Every `--extern-<name>` (SDE included, for its non-window-management
+///     calls - see above; plus Hacker Mode, Cybersecurity Mode, and any
+///     future target) speaks `sde-ipc` (see that crate's module docs) on
+///     `comphwde-<name>.sock` - `extern_ipc.rs` is the generic server side
+///     for all of them, so a new target beyond these doesn't need any
+///     changes here at all. Hacker Mode's
+///     session launcher (`hacker-mode-session`, in the Hacker-Mode repo)
+///     runs `comphwde --extern-hacker-mode` via its own vendored
+///     `hacker-mode-ipc` crate (see `hacker-mode/` in this workspace for a
+///     reference copy, and that crate's module docs for why Hacker Mode
+///     vendors its own separate copy rather than depending on this
+///     repository). Cybersecurity Mode's session launcher is expected to
+///     run `comphwde --extern-cybersecurity-mode` the same way, once it
+///     has one - see `cybersecurity-mode/` in this workspace for its own
+///     reference copy of the client side of this same protocol, modeled
+///     directly on `hacker-mode/`.
 ///
 /// Native and extern mode are mutually exclusive for a given comphwde
 /// process - you get one or the other, never both - so there is exactly
-/// one control socket, one config dir and one output name per process,
+/// one control channel, one config dir and one output name per process,
 /// same as before this flag existed.
 #[derive(Debug, Clone)]
 pub struct ExternMode {
