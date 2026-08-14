@@ -32,6 +32,10 @@ pub struct RenderInputs<'a> {
     pub config: &'a CompositorConfig,
     pub focused_window: Option<u64>,
     pub wallpaper: &'a Wallpaper,
+    pub title_cache: &'a std::cell::RefCell<crate::title_text::TitleTextureCache>,
+    pub idle_dimmed: bool,
+    pub cursor_visible: bool,
+    pub cursor_location: smithay::utils::Point<f64, smithay::utils::Logical>,
 }
 
 impl<'a> From<&'a HwdeState> for RenderInputs<'a> {
@@ -42,6 +46,10 @@ impl<'a> From<&'a HwdeState> for RenderInputs<'a> {
             config: &state.config,
             focused_window: state.focused_window,
             wallpaper: &state.wallpaper,
+            title_cache: &state.title_cache,
+            idle_dimmed: state.idle_dimmed,
+            cursor_visible: !matches!(state.cursor_status, smithay::input::pointer::CursorImageStatus::Hidden),
+            cursor_location: state.pointer.current_location(),
         }
     }
 }
@@ -71,14 +79,22 @@ smithay::backend::renderer::element::render_elements! {
     /// Windows plus all four `wlr-layer-shell` layers, in the correct
     /// relative order - see `space_render_elements`.
     Space = SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
-    /// The desktop wallpaper - always the backmost element.
-    Wallpaper = TextureRenderElement<GlesTexture>,
     /// Minimal SSD: a solid-color grab bar (+ close-button hit region) for
-    /// windows that negotiated server-side decoration. No title text yet -
-    /// that needs a font-rasterization pipeline this compositor doesn't
-    /// have; move-by-dragging and click-to-close both work already via
-    /// `grabs.rs` and don't depend on anything being drawn here.
+    /// windows that negotiated server-side decoration, plus - see
+    /// `Texture` below - rasterized title text on top of it.
     Decoration = SolidColorRenderElement,
+    /// Any GPU-texture-backed element with no client surface behind it -
+    /// the wallpaper (`wallpaper.rs`, always the backmost element pushed)
+    /// and rasterized window titles (`title_text.rs`) both push through
+    /// this one variant, even though they're semantically different
+    /// things, because `render_elements!` generates one `From<T>` impl
+    /// per *type*, not per role - two variants both wrapping
+    /// `TextureRenderElement<GlesTexture>` is a compile error (conflicting
+    /// `From` impls: `E0119`, hit and fixed during this project's first
+    /// real compile), not just a style choice. Which one a given push
+    /// actually is only matters for the order it's added in
+    /// `build_output_elements`, not which variant name it goes through.
+    Texture = TextureRenderElement<GlesTexture>,
 }
 
 /// Height, in logical pixels, of the minimal SSD grab bar.
@@ -108,7 +124,7 @@ pub enum SsdHit {
 pub fn ssd_hit_test(state: &HwdeState, pos: Point<f64, smithay::utils::Logical>) -> Option<SsdHit> {
     let pos_i = pos.to_i32_round();
     for managed in &state.windows {
-        if !managed.is_ssd || managed.is_minimized {
+        if !managed.is_ssd || managed.is_minimized || managed.is_fullscreen {
             continue;
         }
         let Some(loc) = state.space.element_location(&managed.window) else { continue };
@@ -127,12 +143,14 @@ pub fn ssd_hit_test(state: &HwdeState, pos: Point<f64, smithay::utils::Logical>)
 }
 
 /// Builds the decoration elements (grab bar + close button) for every
-/// mapped, non-minimized window that has `is_ssd` set.
+/// mapped, non-minimized, non-fullscreen window that has `is_ssd` set -
+/// see `ManagedWindow::is_fullscreen`'s doc comment for why fullscreen
+/// specifically also suppresses this, unlike maximize.
 fn decoration_elements(inputs: &RenderInputs, scale: f64) -> Vec<SolidColorRenderElement> {
     let mut elements = Vec::new();
 
     for managed in inputs.windows {
-        if !managed.is_ssd || managed.is_minimized {
+        if !managed.is_ssd || managed.is_minimized || managed.is_fullscreen {
             continue;
         }
         let Some(loc) = inputs.space.element_location(&managed.window) else { continue };
@@ -175,6 +193,118 @@ fn decoration_elements(inputs: &RenderInputs, scale: f64) -> Vec<SolidColorRende
     elements
 }
 
+/// Synthetic software cursor - a small filled arrow silhouette (five
+/// stacked/offset rectangles, hotspot at the top-left corner), drawn at
+/// `inputs.cursor_location`.
+///
+/// **Why this exists**: nothing rendered a cursor at all before this -
+/// `HwdeState::cursor_status` (set from `SeatHandler::cursor_image` in
+/// `handlers/seat.rs`) was tracked but never read by anything in
+/// `render_elements.rs` or either backend. On `winit_backend.rs` this was
+/// mostly masked by the host OS's own cursor showing through the window
+/// it renders into; on `backend_drm.rs` - a real, exclusive KMS session
+/// with no host cursor to fall back on - this meant **no visible pointer
+/// at all**.
+///
+/// **Why a synthetic shape instead of the client's actual requested
+/// cursor**: `CursorImageStatus::Surface(wl_surface)` (what a real
+/// client sets via `wl_pointer.set_cursor`, e.g. a themed arrow or an
+/// I-beam over text) needs walking that surface's buffer/subsurface
+/// tree through Smithay's surface-render-element helpers and resolving
+/// its hotspot from the surface's cursor role data - real, doable work,
+/// just enough additional unverified API surface (the exact helper
+/// function, its exact signature, where the hotspot actually lives) that
+/// getting *a* visible cursor working correctly and low-risk first,
+/// rather than stacking more uncertainty on top in the same pass, felt
+/// like the right scope for this round. `CursorImageStatus::Named(..)`
+/// (a themed icon by name, e.g. before any client has set a custom
+/// surface) is further out of scope again - it needs an XCursor theme
+/// loader, a whole separate file-format-parsing subsystem. This function
+/// only distinguishes `Hidden` (nothing drawn - `inputs.cursor_visible`)
+/// from "anything else" (this placeholder arrow) - it doesn't yet look
+/// at *what* the non-hidden status actually is.
+fn cursor_elements(inputs: &RenderInputs, scale: f64) -> Vec<SolidColorRenderElement> {
+    if !inputs.cursor_visible {
+        return Vec::new();
+    }
+
+    let to_physical = |r: Rectangle<i32, smithay::utils::Logical>| -> Rectangle<i32, Physical> {
+        Rectangle::new(
+            ((r.loc.x as f64 * scale).round() as i32, (r.loc.y as f64 * scale).round() as i32).into(),
+            ((r.size.w as f64 * scale).round() as i32, (r.size.h as f64 * scale).round() as i32).into(),
+        )
+    };
+
+    let origin = inputs.cursor_location.to_i32_round::<i32>();
+    let white = Color32F::new(1.0, 1.0, 1.0, 1.0);
+    let outline = Color32F::new(0.0, 0.0, 0.0, 1.0);
+
+    // Five 2px-tall horizontal slices, each starting further right than
+    // the last and one shorter, approximating a left-leaning arrow
+    // silhouette - crude, but unambiguous and immediately recognizable
+    // as "a pointer", which is the entire bar this needs to clear (there
+    // was none before). `slices` is `(y_offset, x_offset, width)`, all
+    // logical px, hotspot at `(0, 0)` (this shape's top-left corner).
+    const SLICES: &[(i32, i32, i32)] = &[(0, 0, 14), (2, 0, 12), (4, 0, 10), (6, 0, 8), (8, 2, 4)];
+
+    let mut elements = Vec::with_capacity(SLICES.len() * 2);
+    for &(dy, dx, width) in SLICES {
+        let rect_logical: Rectangle<i32, smithay::utils::Logical> =
+            Rectangle::new((origin.x + dx, origin.y + dy).into(), (width, 2).into());
+        // A 1px dark outline behind each slice (the white slice above it
+        // in the element list - pushed first, and first = frontmost, see
+        // this file's established convention - covers its center and
+        // leaves the outline visible only at the edges) so the cursor
+        // stays visible over both light and dark window content, not
+        // just one or the other.
+        let outline_logical: Rectangle<i32, smithay::utils::Logical> =
+            Rectangle::new((origin.x + dx - 1, origin.y + dy - 1).into(), (width + 2, 4).into());
+        elements.push(SolidColorRenderElement::new(
+            smithay::backend::renderer::element::Id::new(),
+            to_physical(rect_logical),
+            smithay::backend::renderer::utils::CommitCounter::default(),
+            white,
+            Kind::Unspecified,
+        ));
+        elements.push(SolidColorRenderElement::new(
+            smithay::backend::renderer::element::Id::new(),
+            to_physical(outline_logical),
+            smithay::backend::renderer::utils::CommitCounter::default(),
+            outline,
+            Kind::Unspecified,
+        ));
+    }
+    elements
+}
+
+/// Builds title-text elements for every window `decoration_elements`
+/// drew a bar for - kept as a separate pass (rather than folded into
+/// `decoration_elements`) because it needs `&mut GlesRenderer` (to
+/// rasterize/upload a texture, via `TitleTextureCache`) while
+/// `decoration_elements` only needs the read-only `RenderInputs`; see
+/// `build_output_elements` for why that split matters when the renderer
+/// is itself borrowed from `HwdeState` (DRM backend case).
+fn title_elements(inputs: &RenderInputs, renderer: &mut GlesRenderer, scale: f64) -> Vec<TextureRenderElement<GlesTexture>> {
+    let mut cache = inputs.title_cache.borrow_mut();
+    let mut elements = Vec::new();
+
+    for managed in inputs.windows {
+        if !managed.is_ssd || managed.is_minimized || managed.is_fullscreen {
+            continue;
+        }
+        let Some(loc) = inputs.space.element_location(&managed.window) else { continue };
+        let width = managed.window.geometry().size.w;
+        let bar = ssd_bar_geometry(loc, width);
+        let title = managed.window.toplevel().map(crate::state::with_title).unwrap_or_default();
+
+        if let Some(element) = cache.element_for(renderer, managed.id, &title, bar, scale) {
+            elements.push(element);
+        }
+    }
+
+    elements
+}
+
 /// Draws a colored border around the focused window, if `config.border_width`
 /// is positive - four thin solid-color rectangles (top/bottom/left/right)
 /// framing the window's geometry, reusing the exact same
@@ -189,7 +319,7 @@ fn focus_border_elements(inputs: &RenderInputs, scale: f64) -> Vec<SolidColorRen
     }
     let Some(id) = inputs.focused_window else { return Vec::new() };
     let Some(managed) = inputs.windows.iter().find(|w| w.id == id) else { return Vec::new() };
-    if managed.is_minimized {
+    if managed.is_minimized || managed.is_fullscreen {
         return Vec::new();
     }
     let Some(loc) = inputs.space.element_location(&managed.window) else { return Vec::new() };
@@ -244,12 +374,48 @@ pub fn build_output_elements(
     let scale = output.current_scale().fractional_scale();
     let mut elements: Vec<OutputRenderElement> = Vec::new();
 
+    // -1. Cursor - absolute frontmost, even over the idle-dim overlay
+    //     below, so there's still a visible pointer to click/move with to
+    //     wake from it (this is a screensaver, not a lock screen - see
+    //     that overlay's own comment).
+    elements.extend(cursor_elements(&inputs, scale).into_iter().map(OutputRenderElement::Decoration));
+
+    // 0. Idle-dim overlay - frontmost of literally everything else (even the
+    //    focus border), since the whole point is to visually cover the
+    //    screen. See `HwdeState::idle_dimmed`'s doc comment in `state.rs`
+    //    for what this is - a screensaver-style dimmer, NOT a lock screen
+    //    or a security boundary of any kind. Input is never intercepted
+    //    because of this flag (see `input.rs`); it only ever affects what
+    //    gets drawn.
+    if inputs.idle_dimmed {
+        elements.push(OutputRenderElement::Decoration(SolidColorRenderElement::new(
+            smithay::backend::renderer::element::Id::new(),
+            Rectangle::new((0, 0).into(), (output_size.0, output_size.1).into()),
+            smithay::backend::renderer::utils::CommitCounter::default(),
+            // Near-opaque rather than fully opaque (0.92 alpha) so a
+            // client rendering *underneath* isn't a complete guess if
+            // something ever goes wrong upstream of this flag - a fully
+            // black, fully opaque overlay would look identical whether
+            // the session is idly dimmed or the compositor lost track of
+            // every window, which is a worse failure mode to be
+            // indistinguishable from.
+            Color32F::new(0.0, 0.0, 0.0, 0.92),
+            Kind::Unspecified,
+        )));
+    }
+
     // 1a. Focused-window border - frontmost of all (drawn last, in front
     //     of even the SSD grab bar, since it should always read as "on
     //     top" of the window it's framing).
     elements.extend(focus_border_elements(&inputs, scale).into_iter().map(OutputRenderElement::Decoration));
 
-    // 1b. Decorations - grab bar/close button.
+    // 1b. Title text - drawn just behind the border but in front of the
+    //     bar itself, so it sits legibly on top of the `Decoration` bar
+    //     background pushed below. Needs `renderer` (texture rasterize/
+    //     upload), unlike the other decoration passes here.
+    elements.extend(title_elements(&inputs, renderer, scale).into_iter().map(OutputRenderElement::Texture));
+
+    // 1c. Decorations - grab bar/close button.
     elements.extend(decoration_elements(&inputs, scale).into_iter().map(OutputRenderElement::Decoration));
 
     // 2. Windows + all layer-shell layers (space_render_elements already
@@ -266,7 +432,7 @@ pub fn build_output_elements(
 
     // 3. Wallpaper - backmost (drawn first).
     if let Some(wallpaper) = inputs.wallpaper.render_element(output_size) {
-        elements.push(OutputRenderElement::Wallpaper(wallpaper));
+        elements.push(OutputRenderElement::Texture(wallpaper));
     }
 
     elements
