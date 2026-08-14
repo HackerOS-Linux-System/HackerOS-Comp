@@ -1,1 +1,14 @@
+[package]
+name = "cybersecurity-mode-ipc"
+version = "0.1.0"
+edition = "2021"
+description = "Reference copy, within the comphwde/HWDE workspace, of the client side of the --extern-cybersecurity-mode wire protocol (identical to sde-ipc's protocol - see this crate's module docs). Not linked into the comphwde binary; kept here purely as workspace-local documentation and a target for this workspace's own protocol tests, exactly mirroring hacker-mode/'s role for --extern-hacker-mode. Cybersecurity Mode's actually shipped Tauri backend (cybersec-mode/source-code/backend, in its own repository) doesn't depend on this crate directly today - it doesn't talk to a compositor at all yet (see its own README's 'co jeszcze wymaga rozbudowy' notes) - but is expected to vendor its own separate, standalone copy of it once it does, the same way Hacker Mode vendors its own copy of hacker-mode-ipc instead of depending on this one."
+license = "GPL-3.0"
 
+[dependencies]
+# Same generic extern-mode protocol/transport every `--extern-<name>`
+# target that isn't SDE speaks - see this crate's module docs for why we
+# depend on it instead of duplicating it here.
+sde-ipc = { path = "../sde" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
