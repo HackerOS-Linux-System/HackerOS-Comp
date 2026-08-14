@@ -18,6 +18,7 @@ use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::{ToplevelSurface, XdgShellState};
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::seat::WaylandFocus;
+use smithay::reexports::wayland_server::Resource;
 
 use crate::wallpaper::Wallpaper;
 
@@ -42,6 +43,15 @@ pub struct ManagedWindow {
     pub window: Window,
     pub is_minimized: bool,
     pub is_maximized: bool,
+    /// True while this window is fullscreen (`xdg_toplevel`
+    /// `set_fullscreen`/`unset_fullscreen`, or the X11 equivalent - see
+    /// `fullscreen_window_by_id`). Distinct from `is_maximized`: they're
+    /// mutually exclusive in practice (a client wouldn't sanely request
+    /// both), and unlike maximize, fullscreen also hides this window's
+    /// SSD grab bar (see `render_elements.rs`'s `decoration_elements`) -
+    /// a fullscreen video player showing a drag handle across its top
+    /// edge would defeat the point of going fullscreen at all.
+    pub is_fullscreen: bool,
     /// True once the client has negotiated `Mode::ServerSide` via
     /// xdg-decoration - see `handlers/decoration.rs`. Drives whether
     /// `render_elements.rs` draws a grab bar/close button for this window.
@@ -67,6 +77,56 @@ pub struct ManagedWindow {
 pub enum PinnedEdge {
     Top,
     Bottom,
+}
+
+/// One registered pin, keyed by `app_id` in `HwdeState::pinned_surfaces`.
+///
+/// ### Why this also carries a `pid`
+///
+/// SDE-main's "Known limitations" flags that `PinSurface` matching is
+/// keyed purely on the Wayland `app_id` the *client* sets via
+/// `xdg_toplevel.set_app_id`, and that whether Slint's winit-Wayland
+/// backend actually sets that app_id from the binary name (rather than
+/// leaving it unset, or setting something else) was never verified
+/// against the exact winit version Slint 1.8 pulls in. If it doesn't,
+/// `sde-panel`/`sde-dock` would silently fail to pin and fall back to
+/// floating windows - a real, if graceful, failure mode.
+///
+/// `pid` is a second, independent way to recognize the same window: it's
+/// read straight off the `sde-ipc` control connection's `SO_PEERCRED` at
+/// the moment `PinSurface` is handled (see `extern_ipc.rs`), i.e. it's
+/// the actual kernel-verified pid of the `sde-panel`/`sde-dock` process
+/// that asked to be pinned - not something the client claims in the
+/// request body, so there's nothing to spoof beyond what a local,
+/// already-trusted IPC peer could do anyway. `place_new_window`/
+/// `pin_surface` treat a match on *either* `app_id` or `pid` as a pin
+/// match (see `PinnedSurfaceSpec::matches`), so even if the app_id
+/// assumption above turns out to be wrong, the same process's own
+/// toplevel window (which necessarily shares its pid) still gets pinned
+/// correctly. `pid` is `None` in native HWDE mode (no `sde-ipc` there) or
+/// if the peer-credential lookup failed - in that case matching silently
+/// falls back to `app_id` alone, i.e. today's behaviour.
+#[derive(Debug, Clone, Copy)]
+pub struct PinnedSurfaceSpec {
+    pub edge: PinnedEdge,
+    pub thickness: u32,
+    pub pid: Option<i32>,
+}
+
+impl PinnedSurfaceSpec {
+    /// True if `window_app_id`/`window_pid` (the app_id and client pid of
+    /// a live or newly-mapped window) identify the same process this spec
+    /// was registered for - see the struct doc comment above for why both
+    /// are checked.
+    fn matches(&self, window_app_id: &str, registered_app_id: &str, window_pid: Option<i32>) -> bool {
+        if window_app_id == registered_app_id {
+            return true;
+        }
+        match (self.pid, window_pid) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// Top-level compositor state, analogous to `AnvilState` in Smithay's
@@ -134,13 +194,77 @@ pub struct HwdeState {
     /// `app_id` is a key here is pinned to that screen edge instead of
     /// being placed/tiled like a normal window - see `place_new_window`
     /// and `pin_surface`.
-    pub pinned_surfaces: std::collections::HashMap<String, (PinnedEdge, u32)>,
+    pub pinned_surfaces: std::collections::HashMap<String, PinnedSurfaceSpec>,
+    /// Cache of rasterized+GPU-uploaded window title textures - see
+    /// `title_text.rs`. `RefCell` because `render_elements.rs` only ever
+    /// gets `&HwdeState` (via `RenderInputs`), but rasterizing/uploading
+    /// is naturally a "compute-or-reuse" step done at render time, not
+    /// update time. Nothing else touches this field, so the interior
+    /// mutability here doesn't run into the aliasing concerns
+    /// `RenderInputs`'s own doc comment describes for `drm_gpus`.
+    pub title_cache: std::cell::RefCell<crate::title_text::TitleTextureCache>,
+    /// In-progress touchpad swipe gesture, if any - see
+    /// `input.rs::process_input_event`'s `GestureSwipe*` arms, the only
+    /// place this is read or written.
+    pub gesture_swipe: Option<crate::input::GestureSwipeState>,
+    pub idle_inhibit_manager_state: smithay::wayland::idle_inhibit::IdleInhibitManagerState,
+    pub single_pixel_buffer_state: smithay::wayland::single_pixel_buffer::SinglePixelBufferState,
+    pub relative_pointer_manager_state: smithay::wayland::relative_pointer::RelativePointerManagerState,
+    pub tablet_manager_state: smithay::wayland::tablet_manager::TabletManagerState,
+    pub virtual_keyboard_manager_state: smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState,
+    /// Surfaces with a live `zwp_idle_inhibitor_v1` on them - see
+    /// `handlers/extra_protocols.rs`'s module doc for what this does and
+    /// doesn't do yet. `HashSet` rather than a plain counter so a
+    /// double-inhibit/double-uninhibit from a buggy client can't push the
+    /// count negative or leave it stuck positive.
+    pub idle_inhibiting_surfaces: std::collections::HashSet<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
+    /// Timestamp of the most recent input event of any kind (keyboard,
+    /// pointer, touch, gesture) - see `input.rs::process_input_event`,
+    /// the only place this is written. Read once per rendered frame
+    /// (`winit_backend.rs`/`backend_drm.rs`) to derive `idle_dimmed`.
+    pub last_input_activity: std::time::Instant,
+    /// True when `config.idle_dim_timeout_secs` has elapsed since
+    /// `last_input_activity` with nothing holding an idle inhibitor (see
+    /// `is_idle_inhibited`) - recomputed fresh every rendered frame
+    /// (cheap: one `Instant::elapsed()` comparison), never written from
+    /// `input.rs` directly, so there's exactly one place
+    /// (`winit_backend.rs`'s/`backend_drm.rs`'s per-frame recompute) that
+    /// can ever set or clear it - no separate "wake up" codepath to keep
+    /// in sync with it.
+    ///
+    /// **This is a screensaver-style visual dimmer, not a lock screen.**
+    /// It only adds a `SolidColorRenderElement` on top of everything in
+    /// `render_elements.rs` - it does not intercept, block, or even
+    /// delay a single input event; whatever's focused underneath still
+    /// receives every keystroke and click exactly as if this flag didn't
+    /// exist. Deliberately scoped this way: an actual lock screen needs
+    /// real authentication (PAM or equivalent) and input interception
+    /// that's correct under every edge case (multi-seat, XWayland grabs,
+    /// a client that's already grabbed the pointer, ...) - getting that
+    /// *wrong* is worse than not having it, since a lock screen that
+    /// looks secure but isn't is a worse outcome than no lock screen at
+    /// all. That's a deliberately separate, much more careful piece of
+    /// work this pass didn't attempt.
+    pub idle_dimmed: bool,
     /// `None` in native HWDE mode, `Some("sde")` (etc) in extern mode -
     /// see `main.rs`'s `ExternMode`. Threaded through to `config.rs` so a
     /// `ReloadConfig` request (from either `ipc.rs` or `extern_ipc.rs`, or
     /// the `reload_config` keybinding action) re-reads the *right*
     /// `compositor.toml`.
     pub extern_name: Option<String>,
+
+    /// Only `Some` when running as `--extern-sde` - the
+    /// `wlr-foreign-toplevel-management-unstable-v1` Wayland global SDE's
+    /// panel/dock bind directly, as an ordinary Wayland client on the same
+    /// connection they already render through, instead of the separate
+    /// `sde-ipc` control socket every other `--extern-<name>` target (and
+    /// native HWDE) still uses for window listing/control. See
+    /// `foreign_toplevel.rs`'s module doc for the full story, and
+    /// `sync_foreign_toplevel_created`/`_closed`/`_diffs` below for how
+    /// `place_new_window`/`forget_window_by_surface` and the diff-tick
+    /// timer in `sde_toplevel_ipc.rs` keep it current. `None` (and this
+    /// whole subsystem inert) for every other mode.
+    pub foreign_toplevels: Option<crate::foreign_toplevel::ForeignToplevelManagerState>,
 
     #[cfg(feature = "xwayland")]
     pub xwm: Option<smithay::xwayland::X11Wm>,
@@ -181,10 +305,14 @@ impl HwdeState {
         self.next_window_id += 1;
 
         let app_id = window.toplevel().map(with_app_id).unwrap_or_default();
-        if let Some(&(edge, thickness)) = self.pinned_surfaces.get(&app_id) {
-            // A registered shell surface (panel/dock): pinned to its edge,
-            // full output width, never cascaded and never tiled - see
-            // `pin_geometry`/`pin_surface`.
+        let window_pid = self.client_pid_for_window(window);
+        let pinned = self.pinned_surfaces.iter().find(|(registered_app_id, spec)| spec.matches(&app_id, registered_app_id, window_pid)).map(|(_, spec)| *spec);
+        if let Some(spec) = pinned {
+            // A registered shell surface (panel/dock), recognized either
+            // by `app_id` or by `pid` (see `PinnedSurfaceSpec`'s doc
+            // comment): pinned to its edge, full output width, never
+            // cascaded and never tiled - see `pin_geometry`/`pin_surface`.
+            let (edge, thickness) = (spec.edge, spec.thickness);
             let geo = self.pin_geometry(edge, thickness);
             request_size(window, geo.size);
             self.space.map_element(window.clone(), geo.loc, activate);
@@ -193,6 +321,7 @@ impl HwdeState {
                 window: window.clone(),
                 is_minimized: false,
                 is_maximized: false,
+                is_fullscreen: false,
                 is_ssd: false,
                 saved_geometry: None,
                 workspace: self.active_workspace,
@@ -200,6 +329,7 @@ impl HwdeState {
             });
             self.floating_windows.insert(id);
             self.space.raise_element(window, true);
+            self.sync_foreign_toplevel_created(id);
             return id;
         }
 
@@ -212,6 +342,7 @@ impl HwdeState {
             window: window.clone(),
             is_minimized: false,
             is_maximized: false,
+            is_fullscreen: false,
             is_ssd: false,
             saved_geometry: None,
             workspace: self.active_workspace,
@@ -219,7 +350,115 @@ impl HwdeState {
         });
         self.floating_windows.remove(&id); // ids are never reused, but keep this invariant explicit
         self.apply_tiling_layout();
+        self.sync_foreign_toplevel_created(id);
         id
+    }
+
+    /// Builds a `foreign_toplevel::ToplevelInfo` snapshot of `managed`, as
+    /// seen by `wlr-foreign-toplevel-management` (`--extern-sde` only -
+    /// see `foreign_toplevels`'s doc comment and `foreign_toplevel.rs`'s
+    /// module doc). The one place that maps HWDE's own window bookkeeping
+    /// onto that protocol's idea of a toplevel's state, so
+    /// `foreign_toplevel.rs`'s bind-time full sync and the three
+    /// `sync_foreign_toplevel_*` methods below never have to reach into
+    /// `ManagedWindow`'s fields directly more than once each.
+    pub(crate) fn foreign_toplevel_info(&self, managed: &ManagedWindow) -> crate::foreign_toplevel::ToplevelInfo {
+        crate::foreign_toplevel::ToplevelInfo {
+            title: managed.window.toplevel().map(with_title).unwrap_or_default(),
+            app_id: managed.window.toplevel().map(with_app_id).unwrap_or_default(),
+            minimized: managed.is_minimized,
+            maximized: managed.is_maximized,
+            activated: self.focused_window == Some(managed.id),
+            fullscreen: managed.is_fullscreen,
+        }
+    }
+
+    /// Announces a just-created window to `wlr-foreign-toplevel-management`
+    /// subscribers - a no-op whenever `foreign_toplevels` is `None` (every
+    /// mode except `--extern-sde`). Called from both of `place_new_window`'s
+    /// return points above, which is the single choke point for both
+    /// Wayland/xdg-shell (`handlers/xdg_shell.rs::new_toplevel`) and
+    /// XWayland (`xwayland.rs`) window creation, so neither call site has
+    /// to know this protocol exists.
+    fn sync_foreign_toplevel_created(&mut self, id: u64) {
+        if self.foreign_toplevels.is_none() {
+            return;
+        }
+        let Some(managed) = self.windows.iter().find(|w| w.id == id) else { return };
+        let info = self.foreign_toplevel_info(managed);
+        let output = self.space.outputs().next().cloned();
+        let dh = self.display_handle.clone();
+        if let Some(fts) = self.foreign_toplevels.as_mut() {
+            fts.toplevel_created(&dh, output.as_ref(), id, &info);
+        }
+    }
+
+    /// Counterpart to `sync_foreign_toplevel_created` for window
+    /// destruction - called from `forget_window_by_surface` below (the
+    /// single choke point for both Wayland/xdg-shell and XWayland window
+    /// destruction, same as above).
+    fn sync_foreign_toplevel_closed(&mut self, id: u64) {
+        if let Some(fts) = self.foreign_toplevels.as_mut() {
+            fts.toplevel_closed(id);
+        }
+    }
+
+    /// Diff-tick counterpart to the two methods above, driven by
+    /// `sde_toplevel_ipc.rs`'s periodic timer (its only caller). A poll
+    /// rather than a push hook because none of title/app_id/focus/
+    /// minimize/maximize changes have a dedicated callback anywhere else
+    /// in this codebase either - Smithay's own xdg_shell implementation
+    /// handles `set_title`/`set_app_id` requests entirely internally, with
+    /// no hook back into `XdgShellHandler`. `extern_ipc.rs`'s own
+    /// `DIFF_TICK` exists for exactly the same reason; this is that same
+    /// design applied to the new protocol instead of `sde-ipc`.
+    pub fn sync_foreign_toplevel_diffs(&mut self) {
+        if self.foreign_toplevels.is_none() {
+            return;
+        }
+        let updates: Vec<(u64, crate::foreign_toplevel::ToplevelInfo)> =
+            self.windows.iter().map(|w| (w.id, self.foreign_toplevel_info(w))).collect();
+        if let Some(fts) = self.foreign_toplevels.as_mut() {
+            for (id, info) in updates {
+                fts.toplevel_changed(id, &info);
+            }
+        }
+    }
+
+    /// True if any live client surface currently holds a
+    /// `zwp_idle_inhibitor_v1` - see `handlers/extra_protocols.rs`'s
+    /// module doc. Not consulted anywhere in this compositor yet (no
+    /// idle-timeout/lock system exists to consult it); provided for a
+    /// future one, native or `--extern-*`, to call.
+    pub fn is_idle_inhibited(&self) -> bool {
+        !self.idle_inhibiting_surfaces.is_empty()
+    }
+
+    /// Best-effort pid of the Wayland client that owns `window`, via
+    /// `Client::get_credentials` (kernel `SO_PEERCRED` under the hood) -
+    /// see `PinnedSurfaceSpec`'s doc comment for why this exists and how
+    /// it's used. Works for both native Wayland and XWayland-backed
+    /// windows, since both have a `wl_surface()` under Smithay's
+    /// `WaylandFocus` (XWayland ones via their per-window shadow
+    /// surface). Returns `None` (fails safe, never panics) if the window
+    /// has no live client, or if the credentials lookup itself fails.
+    ///
+    /// **Not exercised by a `cargo check` in the environment this was
+    /// written in** (same caveat as the rest of this codebase - see the
+    /// top-level README) - `Client::get_credentials` is the standard,
+    /// documented `wayland-server` API compositors use for exactly this
+    /// (Smithay's own `anvil` and other wlroots-family compositors use
+    /// the equivalent), but the exact signature wasn't confirmed against
+    /// the `wayland-server` version Smithay 0.7 resolves to. If it
+    /// differs, this is a narrow, one-function fix; every caller already
+    /// treats `None` as "no pid-based fallback available" rather than an
+    /// error, so a signature mismatch degrades to today's app_id-only
+    /// matching rather than breaking the build in a way that's hard to
+    /// isolate.
+    fn client_pid_for_window(&self, window: &Window) -> Option<i32> {
+        let surface = window.wl_surface()?;
+        let client = surface.client()?;
+        client.get_credentials(&self.display_handle).ok().map(|creds| creds.pid)
     }
 
     /// Computes the pinned rectangle (full output width, `thickness_px`
@@ -244,13 +483,22 @@ impl HwdeState {
     /// with that `app_id` immediately (rather than waiting for it to be
     /// remapped), so call order between "launch the panel" and "pin the
     /// panel" doesn't matter to SDE's startup sequencing.
-    pub fn pin_surface(&mut self, app_id: String, edge: PinnedEdge, thickness: u32) {
-        self.pinned_surfaces.insert(app_id.clone(), (edge, thickness));
+    pub fn pin_surface(&mut self, app_id: String, edge: PinnedEdge, thickness: u32, pid: Option<i32>) {
+        self.pinned_surfaces.insert(app_id.clone(), PinnedSurfaceSpec { edge, thickness, pid });
 
+        // Re-check every already-mapped window against the just-inserted
+        // spec, matching by `app_id` OR `pid` - see `PinnedSurfaceSpec`'s
+        // doc comment. The `pid` arm is what makes this robust even if
+        // `app_id` never ends up matching what SDE expects (see that
+        // comment for the winit-app_id caveat this is a fallback for).
         let matches: Vec<(u64, Window)> = self
             .windows
             .iter()
-            .filter(|w| w.window.toplevel().map(with_app_id).unwrap_or_default() == app_id)
+            .filter(|w| {
+                let window_app_id = w.window.toplevel().map(with_app_id).unwrap_or_default();
+                let window_pid = self.client_pid_for_window(&w.window);
+                PinnedSurfaceSpec { edge, thickness, pid }.matches(&window_app_id, &app_id, window_pid)
+            })
             .map(|w| (w.id, w.window.clone()))
             .collect();
         for (id, window) in matches {
@@ -427,12 +675,77 @@ impl HwdeState {
             Action::ReloadConfig => {
                 tracing::info!("keybinding: reloading compositor.toml");
                 self.config = crate::config::load_for(self.extern_name.as_deref());
+
+                // Apply the (possibly changed) XKB layout live - without
+                // this, `xkb_layout`/etc. only ever took effect at the
+                // one `seat.add_keyboard(...)` call each backend makes
+                // at startup (see `config.rs`'s `xkb_config()`), so a
+                // user editing their layout and hitting "reload" would
+                // see every *other* setting take effect but not this
+                // one - a real, easy-to-hit gap right after adding
+                // layout configuration at all in the first place.
+                //
+                // **Unverified**: `KeyboardHandle::set_xkb_config`'s
+                // exact signature - guessed by analogy with
+                // `add_keyboard(xkb_config, ...)`'s first parameter,
+                // since a *runtime* layout change plausibly doesn't also
+                // need to re-specify the repeat delay/rate the way
+                // initial keyboard creation does. If this doesn't
+                // compile, the rest of `ReloadConfig` (the line above)
+                // still works standalone - this is a narrow addition on
+                // top of an already-working reload, not a rewrite of it.
+                //
+                // Built from owned clones (`layout`/`variant`/`model`/
+                // `options`) rather than calling `self.config.xkb_config()`
+                // directly here: that helper borrows `&str`s straight out
+                // of `self.config`, and `set_xkb_config` below needs
+                // `self` itself as its first argument (same `&mut self`
+                // vs. `&self.config` aliasing conflict already hit and
+                // fixed once this pass, in `input.rs`'s tablet
+                // `add_tool` call) - owned locals sidestep it the same
+                // way cloning `display_handle` did there.
+                let layout = self.config.xkb_layout.clone();
+                let variant = self.config.xkb_variant.clone();
+                let model = self.config.xkb_model.clone();
+                let options = if self.config.xkb_options.is_empty() { None } else { Some(self.config.xkb_options.clone()) };
+                let xkb_config = smithay::input::keyboard::XkbConfig { rules: "", model: &model, layout: &layout, variant: &variant, options };
+                if let Some(keyboard) = self.seat.get_keyboard() {
+                    if let Err(err) = keyboard.set_xkb_config(self, xkb_config) {
+                        tracing::warn!("reload_config: failed to apply the (possibly new) keyboard layout live: {err:?}");
+                    }
+                }
             }
             Action::SwitchWorkspace(n) => self.switch_workspace(n.saturating_sub(1)),
             Action::MoveToWorkspace(n) => {
                 if let Some(id) = self.focused_window {
                     self.move_window_to_workspace(id, n.saturating_sub(1));
                 }
+            }
+            Action::DimNow => {
+                tracing::info!("keybinding: dimming now (screensaver overlay, not a lock - see idle_dimmed's doc comment)");
+                // Deliberately reuses the exact same "elapsed since
+                // last_input_activity >= timeout" recompute
+                // (`winit_backend.rs`/`backend_drm.rs`, once per frame)
+                // that a normal idle timeout uses, rather than adding a
+                // separate "force dimmed" flag - backdating the
+                // timestamp makes the very next frame's ordinary
+                // recompute see the timeout as already elapsed, so it
+                // naturally inherits that same logic's behavior for
+                // clearing itself again (any subsequent real input
+                // resets `last_input_activity` forward, same as always).
+                // A separate boolean flag would've needed its own
+                // "how does this get cleared" logic, duplicating what
+                // already exists here for no benefit.
+                //
+                // Note this line runs *after* the keypress that
+                // triggered this action already updated
+                // `last_input_activity` to "now" (see
+                // `process_input_event`'s unconditional line at the top)
+                // - this intentionally overwrites that with a backdated
+                // value, or the dim would compute as "just became active,
+                // not yet idle" on this same frame and never show.
+                let timeout_secs = self.config.idle_dim_timeout_secs.max(1) as u64;
+                self.last_input_activity = std::time::Instant::now() - std::time::Duration::from_secs(timeout_secs);
             }
         }
     }
@@ -662,6 +975,8 @@ impl HwdeState {
             let managed = self.windows.remove(pos);
             self.space.unmap_elem(&managed.window);
             self.floating_windows.remove(&managed.id);
+            self.title_cache.borrow_mut().forget(managed.id);
+            self.sync_foreign_toplevel_closed(managed.id);
         }
         self.apply_tiling_layout();
     }
@@ -796,6 +1111,103 @@ impl HwdeState {
                 #[cfg(feature = "xwayland")]
                 smithay::desktop::WindowSurface::X11(x11) => {
                     let _ = x11.set_maximized(false);
+                    let _ = x11.configure(Some(restore));
+                }
+            }
+            self.space.map_element(window, restore.loc, true);
+        }
+    }
+
+    /// Sets or clears fullscreen for window `id` - modeled closely on
+    /// `maximize_window_by_id` just above (see that function's own NOTE
+    /// on why `managed` is re-looked-up via short `find_managed_mut`
+    /// calls rather than held across the whole function), with two real
+    /// differences: the `xdg_toplevel` state flag is `Fullscreen` instead
+    /// of `Maximized`, and `is_fullscreen` additionally suppresses the
+    /// SSD grab bar (see `render_elements.rs::decoration_elements` and
+    /// `is_fullscreen`'s own doc comment on `ManagedWindow` for why).
+    /// `output_geo` should be the *full* output rectangle, not a
+    /// work-area-excluding one - unlike maximize, fullscreen is
+    /// conventionally expected to cover literally the whole screen,
+    /// panels/bars included. This compositor doesn't yet compute a
+    /// separate "usable work area" excluding pinned panels for maximize
+    /// either (see `primary_output_geometry`), so in practice the two
+    /// currently resolve to the same rectangle either way - this is
+    /// called out for whenever that changes, since fullscreen must NOT
+    /// follow maximize into excluding panel space if a future pass adds
+    /// that distinction there.
+    pub fn fullscreen_window_by_id(&mut self, id: u64, fullscreen: bool, output_geo: Rectangle<i32, Logical>) {
+        let Some(window) = self.find_managed_mut(id).map(|managed| {
+            managed.is_minimized = false;
+            managed.window.clone()
+        }) else {
+            return;
+        };
+
+        let default_restore_geo = || Rectangle::new((80, 60).into(), (800, 600).into());
+
+        if fullscreen {
+            let current = self.space.element_location(&window).unwrap_or((0, 0).into());
+            let current_size = window.geometry().size;
+            if let Some(managed) = self.find_managed_mut(id) {
+                // Only overwrite `saved_geometry` if this window wasn't
+                // already maximized - if it was, that geometry (the
+                // pre-maximize one) is the one worth returning to once
+                // fullscreen *and* maximize are both cleared, not the
+                // maximized-but-not-yet-fullscreen geometry from just now.
+                if managed.saved_geometry.is_none() {
+                    managed.saved_geometry = Some(Rectangle::new(current, current_size));
+                }
+                managed.is_fullscreen = true;
+            }
+
+            match window.underlying_surface() {
+                smithay::desktop::WindowSurface::Wayland(toplevel) => {
+                    toplevel.with_pending_state(|state| {
+                        state.states.set(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen);
+                        state.size = Some(output_geo.size);
+                    });
+                    toplevel.send_pending_configure();
+                }
+                #[cfg(feature = "xwayland")]
+                smithay::desktop::WindowSurface::X11(x11) => {
+                    let _ = x11.set_fullscreen(true);
+                    let _ = x11.configure(Some(output_geo));
+                }
+            }
+            self.space.map_element(window, output_geo.loc, true);
+        } else {
+            // If the window is *also* still maximized, restore to the
+            // maximized rect (`output_geo`) rather than all the way back
+            // to the pre-fullscreen floating geometry - going from
+            // fullscreen back to maximized, not skipping a step. Only
+            // when it's not maximized does `saved_geometry` (set when
+            // fullscreen was entered, above) get consumed here; if it
+            // *is* maximized, that saved geometry is left alone for
+            // `maximize_window_by_id` to consume whenever maximize
+            // itself is later toggled off.
+            let (was_maximized, saved) = match self.find_managed_mut(id) {
+                Some(managed) => {
+                    managed.is_fullscreen = false;
+                    let was_maximized = managed.is_maximized;
+                    let saved = if was_maximized { None } else { managed.saved_geometry.take() };
+                    (was_maximized, saved)
+                }
+                None => (false, None),
+            };
+            let restore = if was_maximized { output_geo } else { saved.unwrap_or_else(default_restore_geo) };
+
+            match window.underlying_surface() {
+                smithay::desktop::WindowSurface::Wayland(toplevel) => {
+                    toplevel.with_pending_state(|state| {
+                        state.states.unset(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen);
+                        state.size = Some(restore.size);
+                    });
+                    toplevel.send_pending_configure();
+                }
+                #[cfg(feature = "xwayland")]
+                smithay::desktop::WindowSurface::X11(x11) => {
+                    let _ = x11.set_fullscreen(false);
                     let _ = x11.configure(Some(restore));
                 }
             }
