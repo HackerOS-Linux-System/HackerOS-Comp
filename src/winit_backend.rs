@@ -13,7 +13,7 @@ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
 use smithay::reexports::winit::platform::pump_events::PumpStatus;
-use smithay::utils::{Clock, Transform};
+use smithay::utils::Clock;
 use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
@@ -46,6 +46,12 @@ pub fn run(wallpaper_path: std::path::PathBuf, extern_mode: Option<crate::Extern
         None => (OUTPUT_NAME.to_string(), "HWDE".to_string()),
     };
 
+    // Loaded here (rather than only inline in the `HwdeState { ... }`
+    // literal further down, where it used to be loaded) since the output
+    // setup just below needs `output_transform`/`output_scale` from it
+    // before `HwdeState` itself exists yet.
+    let config = crate::config::load_for(extern_mode.as_ref().map(|m| m.name.as_str()));
+
     let size = backend.window_size();
     let mode = Mode { size, refresh: 60_000 };
     let output = Output::new(
@@ -58,7 +64,12 @@ pub fn run(wallpaper_path: std::path::PathBuf, extern_mode: Option<crate::Extern
         },
     );
     output.create_global::<HwdeState>(&display_handle);
-    output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
+    output.change_current_state(
+        Some(mode),
+        Some(crate::config::parse_transform(&config.output_transform)),
+        Some(smithay::output::Scale::Fractional(config.output_scale)),
+        Some((0, 0).into()),
+    );
     output.set_preferred(mode);
 
     let mut wallpaper = Wallpaper::new(wallpaper_path);
@@ -110,8 +121,18 @@ pub fn run(wallpaper_path: std::path::PathBuf, extern_mode: Option<crate::Extern
     let mut seat_state = SeatState::<HwdeState>::new();
     let mut seat = seat_state.new_wl_seat(&dh, "hwde-seat".to_string());
     let pointer = seat.add_pointer();
-    seat.add_keyboard(Default::default(), 200, 25)?;
+    seat.add_keyboard(config.xkb_config(), 200, 25)?;
     seat.add_touch();
+
+    // `wlr-foreign-toplevel-management-unstable-v1` - registered only for
+    // `--extern-sde` (see `HwdeState::foreign_toplevels`'s doc comment and
+    // `foreign_toplevel.rs`'s module doc for why SDE specifically gets
+    // this instead of `sde-ipc`). `None` - and this whole global simply
+    // never advertised - for every other mode.
+    let foreign_toplevels = match &extern_mode {
+        Some(mode) if mode.name == "sde" => Some(crate::foreign_toplevel::ForeignToplevelManagerState::new(&dh)),
+        _ => None,
+    };
 
     let mut state = HwdeState {
         display_handle: dh.clone(),
@@ -139,13 +160,24 @@ pub fn run(wallpaper_path: std::path::PathBuf, extern_mode: Option<crate::Extern
         wallpaper,
         pending_wallpaper_reload: false,
         socket_name: Some(socket_name),
-        config: crate::config::load_for(extern_mode.as_ref().map(|m| m.name.as_str())),
+        config,
         active_workspace: 0,
         focused_window: None,
         tiling_enabled: std::collections::HashSet::new(),
         floating_windows: std::collections::HashSet::new(),
         pinned_surfaces: std::collections::HashMap::new(),
+        title_cache: std::cell::RefCell::new(crate::title_text::TitleTextureCache::default()),
+        gesture_swipe: None,
+        idle_inhibit_manager_state: smithay::wayland::idle_inhibit::IdleInhibitManagerState::new::<HwdeState>(&dh),
+        single_pixel_buffer_state: smithay::wayland::single_pixel_buffer::SinglePixelBufferState::new::<HwdeState>(&dh),
+        relative_pointer_manager_state: smithay::wayland::relative_pointer::RelativePointerManagerState::new::<HwdeState>(&dh),
+        tablet_manager_state: smithay::wayland::tablet_manager::TabletManagerState::new::<HwdeState>(&dh),
+        virtual_keyboard_manager_state: smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState::new::<HwdeState, _>(&dh, |_client| true),
+        idle_inhibiting_surfaces: std::collections::HashSet::new(),
+        last_input_activity: std::time::Instant::now(),
+        idle_dimmed: false,
         extern_name: extern_mode.as_ref().map(|m| m.name.clone()),
+        foreign_toplevels,
         #[cfg(feature = "xwayland")]
         xwm: None,
         #[cfg(feature = "xwayland")]
@@ -166,8 +198,23 @@ pub fn run(wallpaper_path: std::path::PathBuf, extern_mode: Option<crate::Extern
         // arrives here as an ExternMode (reused purely for config/wallpaper
         // namespacing, same as any other extern target).
         Some(mode) if mode.name == "hackerland" => crate::hackerland_ipc::init(&event_loop.handle())?,
-        // Extern mode speaks sde-ipc (its own protocol - see that crate's
-        // module docs) instead of hwde-ipc.
+        // SDE: window listing/activation/close/minimize/maximize moves to
+        // `wlr-foreign-toplevel-management-unstable-v1` (see
+        // `foreign_toplevel.rs`/`sde_toplevel_ipc.rs` and `main.rs`'s
+        // module doc) instead of `sde-ipc`'s equivalent calls - that's the
+        // whole point of this change. `sde-ipc` itself stays running
+        // alongside it, though, for the calls that protocol has no
+        // equivalent for at all (wallpaper, workspaces, `PinSurface`,
+        // `LaunchApp`, `Shutdown`, `ReloadConfig`) - see
+        // `sde_toplevel_ipc.rs`'s module doc for why dropping those
+        // entirely wasn't an acceptable trade, and this project's
+        // "further work" notes for migrating them off `sde-ipc` too.
+        Some(mode) if mode.name == "sde" => {
+            crate::sde_toplevel_ipc::init(&event_loop.handle())?;
+            crate::extern_ipc::init(&event_loop.handle(), mode.name.clone())?;
+        }
+        // Every other extern target speaks sde-ipc (its own protocol - see
+        // that crate's module docs) instead of hwde-ipc.
         Some(mode) => crate::extern_ipc::init(&event_loop.handle(), mode.name.clone())?,
         None => crate::ipc::init(&event_loop.handle())?,
     }
@@ -202,6 +249,13 @@ pub fn run(wallpaper_path: std::path::PathBuf, extern_mode: Option<crate::Extern
             state.wallpaper.load(backend.renderer());
             state.pending_wallpaper_reload = false;
         }
+
+        // Recomputed fresh every frame from `last_input_activity` - see
+        // `HwdeState::idle_dimmed`'s doc comment for why this is the only
+        // place that ever sets/clears it.
+        state.idle_dimmed = state.config.idle_dim_timeout_secs > 0
+            && !state.is_idle_inhibited()
+            && state.last_input_activity.elapsed().as_secs() >= state.config.idle_dim_timeout_secs as u64;
 
         // --- render ---
         let size = backend.window_size();
