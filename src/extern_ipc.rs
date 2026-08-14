@@ -83,6 +83,16 @@ pub fn init(handle: &LoopHandle<'static, HwdeState>, extern_name: String) -> std
 
 fn handle_connection(stream: UnixStream, state: &mut HwdeState, subscribers: &Subscribers) {
     let _ = stream.set_nonblocking(false);
+
+    // Kernel-verified pid of whichever process opened this connection
+    // (`SO_PEERCRED`). Only consumed by `SdeCall::PinSurface` today - see
+    // `PinnedSurfaceSpec`'s doc comment in `state.rs` for why - but
+    // captured here, for every call, since it's essentially free (already
+    // known to the kernel for any accepted `AF_UNIX` connection) and this
+    // is the one place that has the raw `stream` before it's split into
+    // `reader`/`writer`.
+    let peer_pid: Option<i32> = peer_pid_of(&stream);
+
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(err) => {
@@ -130,7 +140,7 @@ fn handle_connection(stream: UnixStream, state: &mut HwdeState, subscribers: &Su
         return;
     }
 
-    let outcome = dispatch(request.call, state);
+    let outcome = dispatch(request.call, state, peer_pid);
     send(&writer, &SdeResponse { id: request.id, outcome });
 }
 
@@ -216,7 +226,7 @@ fn broadcast_if_changed(state: &mut HwdeState, subscribers: &Subscribers, last: 
     });
 }
 
-fn dispatch(call: SdeCall, state: &mut HwdeState) -> SdeOutcome {
+fn dispatch(call: SdeCall, state: &mut HwdeState, peer_pid: Option<i32>) -> SdeOutcome {
     let ok = |result| SdeOutcome::Ok { result };
     match call {
         SdeCall::Ping => ok(SdeResult::Pong),
@@ -280,7 +290,7 @@ fn dispatch(call: SdeCall, state: &mut HwdeState) -> SdeOutcome {
                 SdePinnedEdge::Top => PinnedEdge::Top,
                 SdePinnedEdge::Bottom => PinnedEdge::Bottom,
             };
-            state.pin_surface(app_id, edge, thickness_px);
+            state.pin_surface(app_id, edge, thickness_px, peer_pid);
             ok(SdeResult::None)
         }
 
@@ -332,5 +342,42 @@ fn into_sde_output(o: hwde_ipc::OutputSummary) -> sde_ipc::SdeOutputInfo {
         refresh_mhz: o.refresh_mhz,
         scale: o.scale,
         primary: o.is_primary,
+    }
+}
+
+/// `getsockopt(fd, SOL_SOCKET, SO_PEERCRED, ...)` for `stream`'s peer -
+/// the pid, uid, and gid of whoever is on the other end of this `AF_UNIX`
+/// connection, straight from the kernel (works for any `AF_UNIX` socket
+/// on Linux; not portable to non-Linux Unixes, which isn't a concern for
+/// this project - see the top-level README on the DRM/libinput/udev
+/// dependency this whole backend already has on Linux specifically).
+///
+/// Exists because `std::os::unix::net::UnixStream::peer_cred()` is still
+/// gated behind the unstable `peer_credentials_unix_socket` feature (this
+/// project's first real compile hit `E0658` on exactly that call) - see
+/// `Cargo.toml`'s comment on the `libc` dependency this uses instead.
+/// Returns `None` on any failure (unsupported platform, closed socket,
+/// ...) rather than panicking; every caller already treats a missing pid
+/// as "no pid-based fallback available," not an error.
+fn peer_pid_of(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+
+    // SAFETY: `fd` is a valid, open file descriptor for the lifetime of
+    // this call (borrowed from `stream`, which outlives this function
+    // call). `&mut cred` points to a validly-sized, aligned `libc::ucred`
+    // and `len` is initialized to that struct's exact size, matching
+    // what `getsockopt` expects for `SO_PEERCRED` - the standard,
+    // widely-used pattern for this exact call (e.g. used by systemd-
+    // adjacent Rust code across the ecosystem).
+    let ret = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_PEERCRED, &mut cred as *mut _ as *mut libc::c_void, &mut len) };
+
+    if ret == 0 {
+        Some(cred.pid)
+    } else {
+        None
     }
 }
