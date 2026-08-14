@@ -60,6 +60,137 @@ pub struct CompositorConfig {
     /// (default `super+l`/`super+h`) - see `state.rs::adjust_master_ratio`.
     pub master_ratio: f32,
     pub keybindings: Vec<Keybinding>,
+    /// Seconds of no input activity before the idle-dim overlay kicks in
+    /// (see `HwdeState::idle_dimmed` in `state.rs` for exactly what that
+    /// does and does not do - short version: a visual dimmer, not a lock
+    /// screen). `0` disables it entirely. `#[serde(default = ...)]` so a
+    /// `compositor.toml` written before this field existed still loads
+    /// instead of falling back to `CompositorConfig::default()` wholesale
+    /// (see `load_for`'s `toml::from_str` call, which fails the *entire*
+    /// parse on one missing non-defaulted field) - the one field on this
+    /// struct that has this annotation, since it's the one added after
+    /// the others were already shipping.
+    #[serde(default = "default_idle_dim_timeout_secs")]
+    pub idle_dim_timeout_secs: u32,
+    /// Output rotation/flip: `"normal"`, `"90"`, `"180"`, `"270"`,
+    /// `"flipped"`, `"flipped-90"`, `"flipped-180"`, `"flipped-270"` -
+    /// the same eight values `wl_output`'s transform enum has, applied
+    /// via `Output::change_current_state` at output-creation time
+    /// (`winit_backend.rs`/`backend_drm.rs::connector_connected`). An
+    /// unrecognized value logs a warning and falls back to `"normal"`
+    /// rather than failing to start - see `parse_transform`. Previously
+    /// hardcoded to `Transform::Normal` with no way to configure it at
+    /// all - see this project's README for that history.
+    #[serde(default = "default_output_transform")]
+    pub output_transform: String,
+    /// Output scale factor (HiDPI). `1.0` is unscaled. Fractional values
+    /// (e.g. `1.5`) are valid - `render_elements.rs` already reads
+    /// `output.current_scale().fractional_scale()` everywhere it needs
+    /// physical-pixel conversion, so nothing else needed to change for
+    /// non-integer scales to work through the existing render path.
+    #[serde(default = "default_output_scale")]
+    pub output_scale: f64,
+    /// Per-output position overrides, keyed by connector name (e.g.
+    /// `"DP-1"`, `"HDMI-A-1"` - the same `"{interface}-{interface_id}"`
+    /// form `backend_drm.rs::connector_connected` already builds for
+    /// `Output::new`). An output with no entry here keeps the existing
+    /// automatic behavior (`winit_backend.rs`'s single output always at
+    /// `(0, 0)`; `backend_drm.rs` places each newly-connected output to
+    /// the right of whatever's already mapped, left to right, widths
+    /// summed). `#[serde(default)]` (an empty map) rather than a
+    /// required field, so a `compositor.toml` written before this
+    /// existed still loads instead of failing the whole parse (same
+    /// reasoning as `idle_dim_timeout_secs`'s own default annotation).
+    #[serde(default)]
+    pub outputs: std::collections::HashMap<String, OutputPlacement>,
+    /// XKB keyboard layout (e.g. `"pl"`, `"de"`, `"us"`) - empty string
+    /// means "let libxkbcommon pick its own default" (effectively US),
+    /// same as the `XkbConfig::default()` this replaces. Previously
+    /// there was no way to configure this at all -
+    /// `seat.add_keyboard(Default::default(), ...)` was hardcoded in
+    /// both backends.
+    #[serde(default)]
+    pub xkb_layout: String,
+    /// XKB layout variant (e.g. `"dvorak"`, `"colemak"`, `""` for the
+    /// layout's own default).
+    #[serde(default)]
+    pub xkb_variant: String,
+    /// XKB model (e.g. `"pc105"`); empty lets libxkbcommon pick.
+    #[serde(default)]
+    pub xkb_model: String,
+    /// XKB options, comma-separated per libxkbcommon convention (e.g.
+    /// `"ctrl:nocaps,grp:alt_shift_toggle"` for caps-lock-as-ctrl plus an
+    /// Alt+Shift layout-switch toggle - the two most commonly requested
+    /// options users reach for). Empty means none set.
+    #[serde(default)]
+    pub xkb_options: String,
+}
+
+/// Builds Smithay's `XkbConfig` from this config's `xkb_*` fields - the
+/// borrowed-`&str` lifetime is why this is a method taking `&self`
+/// (returning borrowed data) rather than something computed once and
+/// stored, so it has to be called fresh at each `seat.add_keyboard(...)`
+/// site rather than cached on `HwdeState` itself.
+impl CompositorConfig {
+    pub fn xkb_config(&self) -> smithay::input::keyboard::XkbConfig<'_> {
+        smithay::input::keyboard::XkbConfig {
+            rules: "",
+            model: &self.xkb_model,
+            layout: &self.xkb_layout,
+            variant: &self.xkb_variant,
+            options: if self.xkb_options.is_empty() { None } else { Some(self.xkb_options.clone()) },
+        }
+    }
+}
+
+/// One output's configured position - see `CompositorConfig::outputs`.
+/// Only position, not mode/transform/scale: those already have their own
+/// (currently global, not per-output) config fields
+/// (`output_transform`/`output_scale`), and giving every output its own
+/// independent transform/scale is a bigger, separate feature than what
+/// this pass set out to add (manual *layout*, not full per-output
+/// configuration).
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct OutputPlacement {
+    pub x: i32,
+    pub y: i32,
+}
+
+fn default_idle_dim_timeout_secs() -> u32 {
+    300
+}
+
+fn default_output_transform() -> String {
+    "normal".to_string()
+}
+
+fn default_output_scale() -> f64 {
+    1.0
+}
+
+/// Parses `config.output_transform`'s string form into Smithay's
+/// `Transform` enum - see that field's doc comment for the accepted
+/// values. Falls back to `Transform::Normal` (with a warning, not a
+/// startup failure) for anything unrecognized, including simple case/
+/// spelling mismatches - a rotated-the-wrong-way or entirely-unrotated
+/// output is a recoverable annoyance a user can fix and reload; refusing
+/// to start over a typo in this one string would not be proportionate.
+pub fn parse_transform(s: &str) -> smithay::utils::Transform {
+    use smithay::utils::Transform;
+    match s.trim().to_lowercase().as_str() {
+        "normal" | "" => Transform::Normal,
+        "90" => Transform::_90,
+        "180" => Transform::_180,
+        "270" => Transform::_270,
+        "flipped" => Transform::Flipped,
+        "flipped-90" | "flipped90" => Transform::Flipped90,
+        "flipped-180" | "flipped180" => Transform::Flipped180,
+        "flipped-270" | "flipped270" => Transform::Flipped270,
+        other => {
+            tracing::warn!("compositor.toml: unrecognized output_transform {other:?}, falling back to \"normal\" - valid values: normal, 90, 180, 270, flipped, flipped-90, flipped-180, flipped-270");
+            Transform::Normal
+        }
+    }
 }
 
 impl Default for CompositorConfig {
@@ -70,6 +201,14 @@ impl Default for CompositorConfig {
             border_width: 2,
             master_ratio: 0.55,
             keybindings: default_keybindings(),
+            idle_dim_timeout_secs: default_idle_dim_timeout_secs(),
+            output_transform: default_output_transform(),
+            output_scale: default_output_scale(),
+            outputs: std::collections::HashMap::new(),
+            xkb_layout: String::new(),
+            xkb_variant: String::new(),
+            xkb_model: String::new(),
+            xkb_options: String::new(),
         }
     }
 }
@@ -126,6 +265,22 @@ pub enum Action {
     ReloadConfig,
     SwitchWorkspace(u32),
     MoveToWorkspace(u32),
+    /// Manually triggers the idle-dim overlay immediately, instead of
+    /// waiting for `config.idle_dim_timeout_secs` of inactivity - see
+    /// `HwdeState::idle_dimmed`'s doc comment in `state.rs` for what that
+    /// overlay is (a screensaver dimmer) and, just as importantly, what
+    /// it explicitly is **not** (a lock screen - no authentication, no
+    /// input interception). No default keybinding maps to this
+    /// deliberately: the conventional muscle-memory shortcut for
+    /// "dim/lock now" on most desktops is `super+l`, and binding this
+    /// non-authenticating action to that exact combo risks a user
+    /// genuinely believing they've locked their session when they
+    /// haven't - the same "looks secure but isn't is worse than not
+    /// having it" reasoning `idle_dimmed`'s doc comment gives for not
+    /// building real authentication in the first place. Available as
+    /// `dim_now` in `compositor.toml` for anyone who wants to bind it
+    /// themselves, understanding what it actually does.
+    DimNow,
 }
 
 impl Keybinding {
@@ -151,6 +306,7 @@ impl Keybinding {
             "focus_prev" => Some(Action::FocusPrev),
             "quit" => Some(Action::Quit),
             "reload_config" => Some(Action::ReloadConfig),
+            "dim_now" => Some(Action::DimNow),
             _ => None,
         }
     }
