@@ -1,8 +1,8 @@
 [package]
-name = "hwde-ipc"
-version = "1.0.0"
+name = "sde-ipc"
+version = "0.1.0"
 edition = "2021"
-description = "Shared IPC protocol between starthwde (shell/session launcher) and comphwde (Wayland compositor)"
+description = "Standalone IPC protocol between comphwde (running with --extern-sde) and SDE, the Slint-based desktop environment. Deliberately independent from hwde-ipc: SDE is a native Slint shell, not a Tauri webview, so it gets its own wire protocol rather than reusing HWDE's."
 license = "GPL-3.0"
 
 [dependencies]
