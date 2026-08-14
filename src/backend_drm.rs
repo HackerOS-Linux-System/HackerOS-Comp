@@ -20,7 +20,7 @@ use smithay::reexports::drm::control::{connector, crtc, Device as ControlDevice,
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
-use smithay::utils::{DeviceFd, Transform};
+use smithay::utils::DeviceFd;
 use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
@@ -153,11 +153,26 @@ pub fn run_udev(wallpaper_path: std::path::PathBuf, extern_mode: Option<crate::E
     let shm_state = ShmState::new::<HwdeState>(&dh, vec![]);
     let output_manager_state = OutputManagerState::new_with_xdg_output::<HwdeState>(&dh);
 
+    // Loaded here (rather than only inline in the `HwdeState { ... }`
+    // literal further down, where it used to be loaded) since
+    // `seat.add_keyboard` just below needs `xkb_layout`/etc. from it
+    // before `HwdeState` itself exists yet - same reasoning as
+    // `winit_backend.rs`'s identical move for `output_transform`/
+    // `output_scale`.
+    let config = crate::config::load_for(extern_mode.as_ref().map(|m| m.name.as_str()));
+
     let mut seat_state = SeatState::<HwdeState>::new();
     let mut seat = seat_state.new_wl_seat(&dh, "hwde-seat".to_string());
     let pointer = seat.add_pointer();
-    seat.add_keyboard(Default::default(), 200, 25)?;
+    seat.add_keyboard(config.xkb_config(), 200, 25)?;
     seat.add_touch();
+
+    // See winit_backend.rs's identical block: only `Some` for
+    // `--extern-sde` (see `HwdeState::foreign_toplevels`'s doc comment).
+    let foreign_toplevels = match &extern_mode {
+        Some(mode) if mode.name == "sde" => Some(crate::foreign_toplevel::ForeignToplevelManagerState::new(&dh)),
+        _ => None,
+    };
 
     let mut state = HwdeState {
         display_handle: dh.clone(),
@@ -185,13 +200,24 @@ pub fn run_udev(wallpaper_path: std::path::PathBuf, extern_mode: Option<crate::E
         wallpaper: crate::wallpaper::Wallpaper::new(wallpaper_path),
         pending_wallpaper_reload: false,
         socket_name: Some(socket_name),
-        config: crate::config::load_for(extern_mode.as_ref().map(|m| m.name.as_str())),
+        config,
         active_workspace: 0,
         focused_window: None,
         tiling_enabled: std::collections::HashSet::new(),
         floating_windows: std::collections::HashSet::new(),
         pinned_surfaces: std::collections::HashMap::new(),
+        title_cache: std::cell::RefCell::new(crate::title_text::TitleTextureCache::default()),
+        gesture_swipe: None,
+        idle_inhibit_manager_state: smithay::wayland::idle_inhibit::IdleInhibitManagerState::new::<HwdeState>(&dh),
+        single_pixel_buffer_state: smithay::wayland::single_pixel_buffer::SinglePixelBufferState::new::<HwdeState>(&dh),
+        relative_pointer_manager_state: smithay::wayland::relative_pointer::RelativePointerManagerState::new::<HwdeState>(&dh),
+        tablet_manager_state: smithay::wayland::tablet_manager::TabletManagerState::new::<HwdeState>(&dh),
+        virtual_keyboard_manager_state: smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState::new::<HwdeState, _>(&dh, |_client| true),
+        idle_inhibiting_surfaces: std::collections::HashSet::new(),
+        last_input_activity: std::time::Instant::now(),
+        idle_dimmed: false,
         extern_name: extern_mode.as_ref().map(|m| m.name.clone()),
+        foreign_toplevels,
         #[cfg(feature = "xwayland")]
         xwm: None,
         #[cfg(feature = "xwayland")]
@@ -225,6 +251,14 @@ pub fn run_udev(wallpaper_path: std::path::PathBuf, extern_mode: Option<crate::E
         // See winit_backend.rs's identical branch for why HackerLand gets
         // routed separately from the generic --extern-<n>/sde-ipc path.
         Some(mode) if mode.name == "hackerland" => crate::hackerland_ipc::init(&event_loop.handle())?,
+        // See winit_backend.rs's identical branch: SDE's window
+        // management moves to wlr-foreign-toplevel-management, with
+        // sde-ipc kept running alongside it for everything that protocol
+        // has no equivalent for.
+        Some(mode) if mode.name == "sde" => {
+            crate::sde_toplevel_ipc::init(&event_loop.handle())?;
+            crate::extern_ipc::init(&event_loop.handle(), mode.name.clone())?;
+        }
         Some(mode) => crate::extern_ipc::init(&event_loop.handle(), mode.name.clone())?,
         None => crate::ipc::init(&event_loop.handle())?,
     }
@@ -441,7 +475,7 @@ fn device_added(session: &mut LibSeatSession, node: DrmNode, path: &Path, state:
         if info.state() != connector::State::Connected || info.modes().is_empty() {
             continue;
         }
-        match connector_connected(&mut gpu, &res, &info, &state.display_handle, &mut state.space) {
+        match connector_connected(&mut gpu, &res, &info, &state.display_handle, &mut state.space, &state.config) {
             Ok(crtc) => {
                 tracing::info!("{node}: lit up {} ({:?}) on {crtc:?}", info.interface().as_str(), info.interface_id());
                 newly_lit.push(crtc);
@@ -501,7 +535,13 @@ fn device_changed(node: DrmNode, state: &mut HwdeState) {
         if info.state() != connector::State::Connected || info.modes().is_empty() {
             continue;
         }
-        match connector_connected(gpu, &res, &info, &state.display_handle, &mut state.space) {
+        match connector_connected(gpu, &res, &info, &state.display_handle, &mut state.space, &state.config) {
+            // (`gpu` here is borrowed from `state.drm_gpus` a few lines
+            // up, `&state.config` from a different field of the same
+            // `state` - disjoint field borrows, expected to be fine, but
+            // this specific pairing is new as of adding `config` to this
+            // call - the one spot to look at first if this particular
+            // line doesn't compile.)
             Ok(crtc) => {
                 tracing::info!("{node}: lit up {} ({:?}) on {crtc:?}", info.interface().as_str(), info.interface_id());
                 newly_lit.push(crtc);
@@ -549,6 +589,7 @@ fn connector_connected(
     info: &connector::Info,
     display_handle: &smithay::reexports::wayland_server::DisplayHandle,
     space: &mut Space<Window>,
+    config: &crate::config::CompositorConfig,
 ) -> anyhow::Result<crtc::Handle> {
     let crtc = find_crtc_for_connector(&gpu.drm, res, info, &gpu.surfaces)
         .ok_or_else(|| anyhow::anyhow!("no free CRTC for connector {}", info.interface().as_str()))?;
@@ -567,7 +608,7 @@ fn connector_connected(
     let output_name = format!("{}-{}", info.interface().as_str(), info.interface_id());
     let (phys_w, phys_h) = info.size().unwrap_or((0, 0));
     let output = Output::new(
-        output_name,
+        output_name.clone(),
         PhysicalProperties {
             size: (phys_w as i32, phys_h as i32).into(),
             subpixel: Subpixel::Unknown,
@@ -577,15 +618,27 @@ fn connector_connected(
     );
     let mode: OutputMode = drm_mode.into();
     output.create_global::<HwdeState>(display_handle);
-    output.change_current_state(Some(mode), Some(Transform::Normal), None, None);
+    output.change_current_state(
+        Some(mode),
+        Some(crate::config::parse_transform(&config.output_transform)),
+        Some(smithay::output::Scale::Fractional(config.output_scale)),
+        None,
+    );
     output.set_preferred(mode);
 
-    // Place side by side with whatever's already mapped, left to right.
-    // Simplest reasonable default for a first multi-monitor pass; nothing
-    // here yet reads a user-configured output layout (compare
-    // winit_backend.rs, which only ever has the one output at (0, 0)).
-    let x_offset: i32 = space.outputs().filter_map(|o| o.current_mode()).map(|m| m.size.w).sum();
-    space.map_output(&output, (x_offset, 0));
+    // Position: a configured override for this specific connector name
+    // wins (see `CompositorConfig::outputs`/`OutputPlacement`); otherwise
+    // fall back to the existing automatic behavior - placed side by side
+    // with whatever's already mapped, left to right, simplest reasonable
+    // default for a first multi-monitor pass.
+    let position = match config.outputs.get(&output_name) {
+        Some(placement) => (placement.x, placement.y),
+        None => {
+            let x_offset: i32 = space.outputs().filter_map(|o| o.current_mode()).map(|m| m.size.w).sum();
+            (x_offset, 0)
+        }
+    };
+    space.map_output(&output, position);
 
     let allocator = GbmAllocator::new(gpu.gbm.clone(), GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
     let exporter = GbmFramebufferExporter::new(gpu.gbm.clone(), Some(gpu.node));
@@ -654,12 +707,31 @@ fn find_crtc_for_connector(
 /// `RenderInputs::from(&state)`, since the renderer it needs to pass to
 /// `build_output_elements` is itself a field of `state`.
 fn render_surface(state: &mut HwdeState, node: DrmNode, crtc: crtc::Handle) {
+    // Recomputed here (before the destructure below borrows pieces of
+    // `state` individually) rather than inline in the `RenderInputs`
+    // literal, since `is_idle_inhibited()` needs `&HwdeState` as a whole -
+    // see `HwdeState::idle_dimmed`'s doc comment for why this is the only
+    // place (alongside `winit_backend.rs`'s equivalent per-frame line)
+    // that ever writes it.
+    let idle_dimmed = state.config.idle_dim_timeout_secs > 0
+        && !state.is_idle_inhibited()
+        && state.last_input_activity.elapsed().as_secs() >= state.config.idle_dim_timeout_secs as u64;
+    state.idle_dimmed = idle_dimmed;
+
+    // Same "compute before the destructure below" reasoning as
+    // `idle_dimmed` above - `cursor_status`/`pointer` aren't among the
+    // fields borrowed out below, so reading them from `state` as a whole
+    // has to happen first.
+    let cursor_visible = !matches!(state.cursor_status, smithay::input::pointer::CursorImageStatus::Hidden);
+    let cursor_location = state.pointer.current_location();
+
     let HwdeState {
         ref windows,
         ref space,
         ref config,
         ref focused_window,
         ref wallpaper,
+        ref title_cache,
         ref mut drm_gpus,
         ..
     } = *state;
@@ -679,6 +751,10 @@ fn render_surface(state: &mut HwdeState, node: DrmNode, crtc: crtc::Handle) {
         config,
         focused_window: *focused_window,
         wallpaper,
+        title_cache,
+        idle_dimmed,
+        cursor_visible,
+        cursor_location,
     };
     let elements = crate::render_elements::build_output_elements(inputs, &mut gpu.renderer, &surface.output, output_size);
 
