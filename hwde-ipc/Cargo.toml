@@ -1,0 +1,11 @@
+[package]
+name = "hwde-ipc"
+version = "1.0.0"
+edition = "2021"
+description = "Shared IPC protocol between starthwde (shell/session launcher) and comphwde (Wayland compositor)"
+license = "GPL-3.0"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
