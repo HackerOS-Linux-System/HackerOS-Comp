@@ -1,11 +1,11 @@
 [package]
 name = "comphwde"
-description = "HWDE Wayland/XWayland compositor (Smithay-based), extended with --extern-sde, --extern-hacker-mode."
+description = "HWDE Wayland/XWayland compositor (Smithay-based), extended with --extern-sde (wlr-foreign-toplevel-management), --extern-hacker-mode, --extern-cybersecurity-mode (sde-ipc)."
 version = "0.0.1"
 edition = "2021"
 authors = ["HackerOS Team <hackeros068@gmail.com>"]
 license = "GPL-3.0"
-repository = "https://github.com/HackerOS-Linux-System/comphwde/"
+repository = "https://github.com/HackerOS-Linux-System/HWDE/"
 rust-version = "1.80"
 
 [[bin]]
@@ -13,22 +13,36 @@ name = "comphwde"
 path = "src/main.rs"
 
 [dependencies]
-hwde-ipc = { path = "sde" }
-# Own-from-scratch protocol used only in `--extern-<name>` mode (see
-# src/extern_ipc.rs and the sde-ipc crate's module docs). Independent of
-# hwde-ipc on purpose - SDE is a native Slint shell, not a Tauri webview.
-# Every `--extern-<name>` target (sde, hacker-mode, ...) speaks this same
-# wire protocol on its own socket; only the socket name differs (see
-# `sde_ipc::socket_path_for`). See `hacker-mode/` in this same workspace
-# for that target's own reference copy of the client side of this
-# protocol - the `[[bin]] comphwde` built from THIS package does not
-# depend on it (`extern_ipc.rs` only implements the *server* side,
-# generically, for any `--extern-<name>`); it's a workspace-local sibling
-# crate, not something this binary links against. See
-# `hacker-mode/src/lib.rs`'s module docs for why Hacker Mode's actually
-# shipped binaries use their own, separately-vendored copy of it instead
-# of depending on this one.
-sde-ipc = { path = "sde/ipc" }
+# Raw getsockopt(SO_PEERCRED) for `extern_ipc.rs`'s pid lookup - std's
+# `UnixStream::peer_cred()` is still gated behind the unstable
+# `peer_credentials_unix_socket` feature (confirmed by this project's
+# first real compile: E0658), so this goes straight to libc instead. A
+# thin, extremely stable FFI surface (`getsockopt`, `SOL_SOCKET`,
+# `SO_PEERCRED`, the `ucred` struct layout) that's been unchanged for
+# many years - much lower risk than depending on an unstable std feature
+# or guessing at a higher-level crate's version-specific API.
+libc = "0.2"
+hwde-ipc = { path = "hwde-ipc" }
+# Own-from-scratch protocol used only in `--extern-<name>` mode for every
+# target except `--extern-sde` (see src/extern_ipc.rs and src/main.rs's
+# module doc, and this crate's own module docs - `--extern-sde` itself
+# now speaks `wlr-foreign-toplevel-management-unstable-v1` instead, see
+# src/foreign_toplevel.rs). Independent of hwde-ipc on purpose - SDE is a
+# native Slint shell, not a Tauri webview. Every remaining
+# `--extern-<name>` target (hacker-mode, cybersecurity-mode, ...) speaks
+# this same wire protocol on its own socket; only the socket name differs
+# (see `sde_ipc::socket_path_for`). See `hacker-mode/` and
+# `cybersecurity-mode/` in this same workspace for those targets' own
+# reference copies of the client side of this protocol - the
+# `[[bin]] comphwde` built from THIS package does not depend on either of
+# them (`extern_ipc.rs` only implements the *server* side, generically,
+# for any `--extern-<name>` that isn't `sde`); they are workspace-local
+# sibling crates, not something this binary links against. See
+# `hacker-mode/src/lib.rs`'s and `cybersecurity-mode/src/lib.rs`'s module
+# docs for why Hacker Mode's (and, eventually, Cybersecurity Mode's)
+# actually shipped binaries use their own, separately-vendored copies of
+# it instead of depending on these workspace-local ones.
+sde-ipc = { path = "sde" }
 # HackerLand: comphwde's own window manager identity/protocol, exposed as
 # the `comphwde wm` subcommand - see wm/Cargo.toml's description (the
 # crate is named `hackerland`; it lives in this repo's `wm/` directory).
@@ -49,6 +63,11 @@ serde_json = "1"
 # same file the shell's "Skróty klawiszowe" settings section reads/writes
 # (source-code/backend/src-tauri/src/commands/keybindings.rs).
 toml = "0.8"
+# Pure-Rust font rasterizer for SSD window title text - see
+# src/title_text.rs's module doc for why this crate specifically (no
+# system font-library linkage, i.e. no fontconfig/freetype dependency)
+# and what's/isn't verified about the exact API surface used.
+fontdue = "0.8"
 
 [dependencies.smithay]
 version = "0.7"
@@ -97,17 +116,18 @@ drm-experimental = [
 # crate's Cargo.toml double as its workspace's. `comphwde` itself is an
 # implicit workspace member (it's the package defined right here);
 # `members` below lists every other path-dependency crate that lives in
-# this repository (`sde/` + `sde/ipc`, `hacker-mode/`'s workspace-local
-# reference copy, and `wm/` for the `comphwde wm` subcommand), which
-# otherwise wouldn't be part of the workspace at all.
+# this repository (`hwde-ipc/` + `sde-ipc/`, `hacker-mode/`'s and
+# `cybersecurity-mode/`'s workspace-local reference copies, and `wm/` for
+# the `comphwde wm` subcommand), which otherwise wouldn't be part of the
+# workspace at all.
 [workspace]
 resolver = "2"
 members = [
+    "hwde-ipc",
     "sde",
-    "sde/ipc",
     "hacker-mode",
-    "wm",
     "cybersecurity-mode",
+    "wm",
 ]
 
 [profile.release]
