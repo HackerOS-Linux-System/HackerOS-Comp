@@ -1,175 +1,297 @@
-mod config;
-mod extern_ipc;
-mod foreign_toplevel;
-mod grabs;
-mod handlers;
-mod hackerland_ipc;
-mod input;
-mod ipc;
-mod render_elements;
-mod sde_toplevel_ipc;
 mod state;
-mod title_text;
-mod wallpaper;
-mod winit_backend;
-#[cfg(feature = "xwayland")]
+mod input;
+mod render;
+mod ipc;
 mod xwayland;
-// Feature-gated real TTY/SDDM session backend (DRM/KMS + udev + libinput +
-// libseat), wired into `main()` below. Every call in it is checked against
-// Smithay 0.7.0 / drm-rs 0.14.1 source directly (see its module doc
-// comment), but hasn't been run against real hardware in this environment -
-// kept behind `drm-experimental` so a normal build is unaffected either way.
-#[cfg(feature = "drm-experimental")]
-mod backend_drm;
+mod protocols;
 
-/// `comphwde` has two run modes, chosen entirely by the presence of a
-/// single CLI flag:
+use std::time::Duration;
+use smithay::backend::session::Session;
+use tracing::{info, error, warn};
+use tracing_subscriber::{EnvFilter, fmt};
+use std::fs;
+
+/// Single fixed-path log file, not a fresh timestamped file per run
+/// (what this used to do — see the git history) — requested so both
+/// `blue-compositor.log` and `blue-environment.log` (the shell's, see
+/// Blue-Environment's `logging.rs`) sit next to each other in one place
+/// a user can `tail -f` without hunting for the latest timestamp.
 ///
-/// * `comphwde` (no flag) - **native mode**. Same as always: this is
-///   HWDE's own compositor, speaking `hwde-ipc` to `starthwde`'s
-///   Tauri/SolidJS frontend on `comphwde.sock`.
-/// * `comphwde --extern-<name>` - **extern mode**. comphwde still does all
-///   the actual Wayland/XWayland compositing, but now namespaces its
-///   config/output/wallpaper-env under `<name>` (upper-cased) instead of
-///   `HWDE`, and speaks a control protocol appropriate to `<name>` instead
-///   of `hwde-ipc` - see "which protocol, for which target" below. This is
-///   how *other* desktop environments/shells - SDE (a Slint shell),
-///   Hacker Mode, Cybersecurity Mode (a Tauri/Solid.js shell; see
-///   `cybersec-mode/` in its own repository - it doesn't speak to a
-///   compositor at all yet, but is already wired up to run as
-///   `--extern-cybersecurity-mode` the same way the others do, ready for
-///   whenever it starts launching real Wayland/XWayland clients) - reuse
-///   comphwde as their compositor without comphwde having to know
-///   anything about any of them specifically beyond which protocol their
-///   `<name>` maps to, and without any of them having to implement a
-///   Wayland compositor from scratch.
-///
-///   **Which protocol, for which target:**
-///
-///   - `--extern-sde` speaks `wlr-foreign-toplevel-management-unstable-v1`
-///     (see `foreign_toplevel.rs` and `sde_toplevel_ipc.rs`) for window
-///     listing/activation/close/minimize/maximize - a real,
-///     independently-specified Wayland protocol extension, bound directly
-///     by SDE's panel/dock on their existing Wayland connection, *not* a
-///     socket. `sde-ipc` (see below) keeps running for SDE too, since
-///     that protocol has no equivalent for wallpaper/workspaces/
-///     `PinSurface`/`LaunchApp`/`Shutdown`/`ReloadConfig` - see
-///     `sde_toplevel_ipc.rs`'s module doc for the full picture, and this
-///     project's "further work" notes for retiring `sde-ipc` for SDE
-///     entirely once those have a replacement too. SDE's session launcher
-///     (`startsde`) always runs `comphwde --extern-sde`.
-///   - Every `--extern-<name>` (SDE included, for its non-window-management
-///     calls - see above; plus Hacker Mode, Cybersecurity Mode, and any
-///     future target) speaks `sde-ipc` (see that crate's module docs) on
-///     `comphwde-<name>.sock` - `extern_ipc.rs` is the generic server side
-///     for all of them, so a new target beyond these doesn't need any
-///     changes here at all. Hacker Mode's
-///     session launcher (`hacker-mode-session`, in the Hacker-Mode repo)
-///     runs `comphwde --extern-hacker-mode` via its own vendored
-///     `hacker-mode-ipc` crate (see `hacker-mode/` in this workspace for a
-///     reference copy, and that crate's module docs for why Hacker Mode
-///     vendors its own separate copy rather than depending on this
-///     repository). Cybersecurity Mode's session launcher is expected to
-///     run `comphwde --extern-cybersecurity-mode` the same way, once it
-///     has one - see `cybersecurity-mode/` in this workspace for its own
-///     reference copy of the client side of this same protocol, modeled
-///     directly on `hacker-mode/`.
-///
-/// Native and extern mode are mutually exclusive for a given comphwde
-/// process - you get one or the other, never both - so there is exactly
-/// one control channel, one config dir and one output name per process,
-/// same as before this flag existed.
-#[derive(Debug, Clone)]
-pub struct ExternMode {
-    /// Normalized (lowercase, alnum/dash) name, e.g. `"sde"`.
-    pub name: String,
+/// `/var/log` normally needs root to create/write to, and this
+/// compositor runs as the logged-in user (a Wayland session isn't
+/// root) — so this tries `/var/log/Blue-Environment/` first and, if
+/// that's not writable (the common case unless something has already
+/// `chown`'d it to the user, e.g. via a packaged tmpfiles.d rule or
+/// install script), falls back to the old per-user cache location
+/// instead of crashing the compositor over a log path. Either way the
+/// *filename* is now fixed (`blue-compositor.log`, appended across
+/// runs) rather than timestamped.
+fn log_file_path() -> std::path::PathBuf {
+    let system_dir = std::path::PathBuf::from("/var/log/Blue-Environment");
+    if fs::create_dir_all(&system_dir).is_ok() {
+        // create_dir_all succeeding doesn't guarantee *this user* can
+        // write inside it if the directory already existed owned by
+        // someone else — verify with an actual write probe.
+        let probe = system_dir.join(".write-test");
+        if fs::write(&probe, b"").is_ok() {
+            let _ = fs::remove_file(&probe);
+            return system_dir;
+        }
+    }
+    let home = dirs::home_dir().expect("Home directory not found");
+    let fallback = home.join(".cache/Blue-Environment/compositor/logs");
+    fs::create_dir_all(&fallback).ok();
+    fallback
 }
 
-fn parse_extern_flag(args: &[String]) -> Option<ExternMode> {
-    args.iter().find_map(|arg| {
-        arg.strip_prefix("--extern-").map(|name| ExternMode {
-            name: name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').map(|c| c.to_ascii_lowercase()).collect(),
-        })
-    })
-}
+fn init_logging() -> tracing_appender::non_blocking::WorkerGuard {
+    let log_dir = log_file_path();
+    let using_system_path = log_dir.starts_with("/var/log");
 
-fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
+    let file_appender = tracing_appender::rolling::never(&log_dir, "blue-compositor.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    let subscriber = fmt::Subscriber::builder()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("blue_compositor=info,smithay=warn")),
         )
-        .init();
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .finish();
 
-    let args: Vec<String> = std::env::args().collect();
+    // Previously this was called *after* `main()`'s own `fmt().init()`
+    // had already installed a global subscriber — `set_global_default`
+    // fails once a subscriber is set, and the old code silently
+    // swallowed that error with `.ok()`, so despite appearances the
+    // compositor was actually always logging to stderr only, never to
+    // the file this function opens. Fixed by making this the *only*
+    // place that installs a subscriber (see `main()`, which no longer
+    // calls `fmt().init()` itself) and by not swallowing the error here
+    // either — a genuine second-install attempt is a real bug worth
+    // panicking on, not silently ignoring again.
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("no other tracing subscriber should be installed before init_logging() runs");
 
-    // `comphwde wm ...`: HackerLand, comphwde's own window manager
-    // identity/protocol (see wm/src/lib.rs's module doc - the crate is
-    // named `hackerland`, living in this repo's `wm/` directory).
-    //
-    // * `comphwde wm` (nothing further) - launch a HackerLand session.
-    //   Falls straight through into the exact same startup path as native
-    //   HWDE mode / `--extern-<n>` mode below, just with `extern_mode`
-    //   forced to `hackerland` - same trick `--extern-<n>` already uses for
-    //   config/wallpaper namespacing, except the IPC branch in
-    //   winit_backend.rs/backend_drm.rs special-cases this name to install
-    //   `hackerland_ipc` (HackerLand's own protocol) instead of the
-    //   generic sde-ipc-based `extern_ipc`.
-    // * `comphwde wm <subcommand> [args...]` - control an *already
-    //   running* HackerLand session instead (list/focus/close windows,
-    //   switch workspaces, ...) and exit; never opens a display.
-    let extern_mode = if args.get(1).map(String::as_str) == Some("wm") {
-        if args.len() > 2 {
-            return hackerland::run(&args[2..]);
-        }
-        Some(ExternMode { name: "hackerland".to_string() })
+    if using_system_path {
+        info!("Logging to {}/blue-compositor.log", log_dir.display());
     } else {
-        parse_extern_flag(&args)
-    };
-
-    // Wallpaper env var is namespaced the same way config/output are:
-    // `HWDE_WALLPAPER` in native mode, `<NAME>_WALLPAPER` in extern mode
-    // (e.g. `SDE_WALLPAPER`), falling back to `HWDE_WALLPAPER` too so an
-    // extern shell doesn't *have* to set its own var if it's happy
-    // sharing HWDE's configured wallpaper.
-    let wallpaper_env_var = match &extern_mode {
-        Some(mode) => format!("{}_WALLPAPER", mode.name.to_uppercase()),
-        None => "HWDE_WALLPAPER".to_string(),
-    };
-    let wallpaper_path = std::env::var(&wallpaper_env_var)
-        .or_else(|_| std::env::var("HWDE_WALLPAPER"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(wallpaper::DEFAULT_WALLPAPER));
-
-    match &extern_mode {
-        Some(mode) if mode.name == "hackerland" => {
-            tracing::info!("HackerLand starting (wallpaper: {})", wallpaper_path.display())
-        }
-        Some(mode) => tracing::info!(
-            "comphwde starting in extern mode for '{}' (wallpaper: {})",
-            mode.name,
-            wallpaper_path.display()
-        ),
-        None => tracing::info!("comphwde starting (wallpaper: {})", wallpaper_path.display()),
+        warn!(
+            "/var/log/Blue-Environment not writable by this user — logging to {}/blue-compositor.log instead. \
+             To use the system path, pre-create it writable by this user, e.g.: \
+             sudo install -d -m 0775 -o $USER -g $USER /var/log/Blue-Environment",
+            log_dir.display()
+        );
     }
 
-    #[cfg(feature = "drm-experimental")]
-    {
-        // Only take over the whole display from a bare TTY - if we're
-        // already inside someone else's Wayland or X11 session (the
-        // overwhelmingly common case during development: running comphwde
-        // from a terminal inside your regular desktop), grabbing every
-        // `/dev/dri` GPU and every input device out from under it via
-        // libseat would fight the session that's already running, not
-        // replace it. `winit_backend::run` (nested window) is what that
-        // situation wants instead, exactly as before this feature existed.
-        let nested = std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
-        if !nested {
-            tracing::info!("no WAYLAND_DISPLAY/DISPLAY set - starting the DRM/udev backend (real TTY session)");
-            return backend_drm::run_udev(wallpaper_path, extern_mode);
-        }
-        tracing::info!("WAYLAND_DISPLAY/DISPLAY set - running nested via winit instead of taking over the DRM/udev session");
+    guard
+}
+
+fn write_desktop_file() -> std::io::Result<()> {
+    let exe_path = std::env::current_exe()?;
+    let desktop_path = dirs::home_dir()
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "No home dir")
+        })?
+        .join(".local/share/wayland-sessions/blue-environment.desktop");
+
+    fs::create_dir_all(desktop_path.parent().unwrap())?;
+    let content = format!(
+        "[Desktop Entry]\nName=Blue Environment\nComment=Blue Wayland Compositor\nExec={}\nType=Application\nCategories=System;\n",
+        exe_path.display()
+    );
+    fs::write(desktop_path, content)
+}
+
+fn main() {
+    // `init_logging()` is now the only subscriber install — see its
+    // doc comment for why this used to double-install (a stderr one
+    // here, then a silently-failing file one) and actually only ever
+    // logged to stderr despite appearances. The returned guard has to
+    // stay alive for the whole process (dropping it flushes and closes
+    // the non-blocking writer), hence binding it here instead of
+    // discarding it.
+    let _log_guard = init_logging();
+    info!("Blue Compositor v0.2 starting...");
+
+    if let Err(e) = write_desktop_file() {
+        warn!("Could not write desktop file: {}", e);
     }
 
-    winit_backend::run(wallpaper_path, extern_mode)
+    // Detect if we already have a display server
+    let has_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+    let has_x11 = std::env::var("DISPLAY").is_ok();
+
+    if has_wayland || has_x11 {
+        warn!(
+            "Existing display session detected (wayland={}, x11={}) - running nested (winit)",
+            has_wayland, has_x11
+        );
+        run_winit();
+    } else {
+        info!("No display server found - using DRM/KMS backend (TTY mode)");
+        run_udev();
+    }
+}
+
+// ── DRM/KMS backend (production, bare-metal / TTY) ─────────────────────────
+
+fn run_udev() {
+    use smithay::backend::session::libseat::LibSeatSession;
+
+    // `LibSeatSession` (this whole function) goes through libseat, which
+    // is itself a seat-management abstraction with *two* real backends:
+    // systemd-logind (talks to org.freedesktop.login1 over D-Bus — no
+    // extra daemon needed, just systemd itself) and seatd (a standalone
+    // daemon, for non-systemd systems or systemd setups without a login1
+    // session). libseat already auto-selects between them at the C
+    // library level — nothing in this function needs to branch on it —
+    // but the compositor was previously silent about *which* one it'll
+    // get, and its one-size-fits-all failure message ("install seatd")
+    // was actively wrong advice on a systemd-logind system where seatd
+    // was never the problem in the first place. This detects which path
+    // is actually available up front so both the success log line and
+    // any failure message are accurate for the system actually running.
+    let has_systemd = std::path::Path::new("/run/systemd/system").exists();
+    let has_logind_session = has_systemd && std::env::var("XDG_SESSION_ID").is_ok();
+    let has_seatd_socket = std::path::Path::new("/run/seatd.sock").exists();
+
+    if has_logind_session {
+        info!("systemd-logind session detected (XDG_SESSION_ID set) — libseat will use it, no seatd needed");
+    } else if has_seatd_socket {
+        info!("No systemd-logind session found — using seatd ({})", "/run/seatd.sock");
+    } else if has_systemd {
+        info!("systemd is running but no XDG_SESSION_ID is set (not launched from a logind session) \
+               and no seatd socket found — session setup will likely fail. \
+               Launch from a logind session (e.g. a logind-managed TTY login) or start seatd.");
+    } else {
+        info!("No systemd detected — this requires seatd (no /run/seatd.sock found yet; is it running?)");
+    }
+
+    let (session, notifier) = match LibSeatSession::new() {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to create libseat session: {}", e);
+            if has_systemd {
+                error!("This system has systemd — either:");
+                error!("  run from a real logind session (log in via a display/login manager or a TTY logind handles), or");
+                error!("  install and enable seatd: sudo systemctl enable --now seatd, then add yourself to its group: sudo usermod -aG seat $USER");
+            } else {
+                error!("No systemd on this system — seatd is required: sudo systemctl enable --now seatd (or the equivalent for your init system)");
+                error!("And add yourself to seat group: sudo usermod -aG seat $USER");
+            }
+            std::process::exit(1);
+        }
+    };
+
+    info!("Seat: {}", session.seat());
+
+    let event_loop: calloop::EventLoop<'static, state::BlueState> =
+        calloop::EventLoop::try_new().expect("Failed to create event loop");
+    let display: wayland_server::Display<state::BlueState> =
+        wayland_server::Display::new().expect("Failed to create Wayland display");
+
+    let loop_handle = event_loop.handle();
+    let mut st = state::BlueState::new(&loop_handle, display);
+
+    // Register session notifier - relays libseat session events (VT
+    // switch, device pause/resume) into the event loop.
+    loop_handle
+        .insert_source(notifier, |event, _, state| {
+            state.handle_session_event(event);
+        })
+        .expect("Failed to insert session notifier");
+
+    st.init_udev(session, &loop_handle);
+
+    // Start XWayland
+    if let Err(e) = st.init_xwayland(&loop_handle) {
+        error!("XWayland failed to start: {} - X11 apps will not work", e);
+    }
+
+    st.init_ipc(&loop_handle);
+
+    // Idle / DPMS timer
+    protocols::idle::init_idle(&st, &loop_handle);
+
+    let socket = st.socket_name().to_string();
+    info!("Compositor ready - WAYLAND_DISPLAY={}", socket);
+
+    // Export environment so spawned apps can find us
+    std::env::set_var("WAYLAND_DISPLAY", &socket);
+    if let Some(xdisp) = st.x11_display {
+        std::env::set_var("DISPLAY", format!(":{}", xdisp));
+        info!("XWayland on DISPLAY=:{}", xdisp);
+    }
+
+    // Set XDG_SESSION_TYPE so apps use Wayland protocols
+    std::env::set_var("XDG_SESSION_TYPE", "wayland");
+    std::env::set_var("XDG_CURRENT_DESKTOP", "Blue");
+
+    run_loop(event_loop, st);
+}
+
+// ── Winit backend (nested, dev/VM) ─────────────────────────────────────────
+
+fn run_winit() {
+    use smithay::backend::winit;
+
+    let event_loop: calloop::EventLoop<'static, state::BlueState> =
+        calloop::EventLoop::try_new().expect("Failed to create event loop");
+    let display: wayland_server::Display<state::BlueState> =
+        wayland_server::Display::new().expect("Failed to create Wayland display");
+
+    let loop_handle = event_loop.handle();
+    let mut st = state::BlueState::new(&loop_handle, display);
+
+    let (winit_backend, winit_evt) =
+        winit::init::<smithay::backend::renderer::gles::GlesRenderer>()
+            .expect("Failed to init winit backend");
+
+    st.init_winit(winit_backend, winit_evt, &loop_handle);
+
+    if let Err(e) = st.init_xwayland(&loop_handle) {
+        error!("XWayland failed: {} - X11 apps unavailable", e);
+    }
+
+    st.init_ipc(&loop_handle);
+
+    // Idle / DPMS timer
+    protocols::idle::init_idle(&st, &loop_handle);
+
+    let socket = st.socket_name().to_string();
+    info!("Nested compositor ready - WAYLAND_DISPLAY={}", socket);
+    std::env::set_var("WAYLAND_DISPLAY", &socket);
+    std::env::set_var("XDG_SESSION_TYPE", "wayland");
+    std::env::set_var("XDG_CURRENT_DESKTOP", "Blue");
+
+    if let Some(xdisp) = st.x11_display {
+        std::env::set_var("DISPLAY", format!(":{}", xdisp));
+    }
+
+    run_loop(event_loop, st);
+}
+
+// ── Main event loop ────────────────────────────────────────────────────────
+
+fn run_loop(
+    mut event_loop: calloop::EventLoop<'static, state::BlueState>,
+    mut state: state::BlueState,
+) {
+    loop {
+        // 16ms ≈ 60 fps budget for the compositor tick
+        if let Err(e) = event_loop.dispatch(Some(Duration::from_millis(16)), &mut state) {
+            error!("Event loop dispatch error: {}", e);
+            break;
+        }
+
+        state.refresh();
+
+        if state.should_exit() {
+            info!("Compositor exit requested");
+            break;
+        }
+    }
+
+    info!("Blue Compositor stopped");
 }
