@@ -1,141 +1,66 @@
 [package]
-name = "comphwde"
-description = "HWDE Wayland/XWayland compositor (Smithay-based), extended with --extern-sde (wlr-foreign-toplevel-management), --extern-hacker-mode, --extern-cybersecurity-mode (sde-ipc)."
-version = "0.0.1"
+name = "hackeros-comp"
+version = "0.2.0"
 edition = "2021"
-authors = ["HackerOS Team <hackeros068@gmail.com>"]
-license = "GPL-3.0"
-repository = "https://github.com/HackerOS-Linux-System/HWDE/"
-rust-version = "1.80"
+description = "HackerOS Compositor — Production Wayland Compositor (Smithay)"
 
-[[bin]]
-name = "comphwde"
-path = "src/main.rs"
-
+# `wp_color_management_v1` landed in upstream wayland-protocols on
+# 2025-02-13 (release 1.41) and, as of this writing, still has no bindings
+# in the `wayland-protocols` *Rust crate* (checked crates.io versions
+# 0.31.0/0.31.2/0.32.1/0.32.4 — none contain it). Until that catches up,
+# it's vendored directly from upstream (protocols-xml/) and compiled via
+# `wayland-scanner`'s `generate_server_code!`/`generate_interfaces!`
+# proc-macros, invoked directly from src/protocols/color_management.rs —
+# NOT a build.rs step. (An earlier pass here tried the old build.rs +
+# `wayland_scanner::generate_code`/`Side` function-based API, which
+# belongs to wayland-scanner <= 0.29; 0.31 replaced it with the
+# macro-based API these macros use, so it must be a normal `[dependencies]`
+# entry, not `[build-dependencies]` — the macros expand while *this*
+# crate's own source is compiled, not in a separate build-script pass.)
+# See src/protocols/color_management.rs for the (intentionally
+# scoped-down) implementation.
+#
+# The macros' generated code references `wayland_backend::protocol::
+# Interface` and core-protocol interface consts (`WL_OUTPUT_INTERFACE`
+# etc.) by direct crate path, not through `wayland_server::backend` —
+# Rust's extern prelude only makes a crate nameable that way if it's a
+# *direct* dependency of this crate, not a transitive one, so
+# `wayland-backend` has to be listed here explicitly even though nothing
+# in our own code refers to it directly. Pinned to match the version
+# `wayland-server` 0.31.14 itself depends on (checked its Cargo.toml)
+# so cargo doesn't have to unify two different semver-compatible ranges.
 [dependencies]
-# Raw getsockopt(SO_PEERCRED) for `extern_ipc.rs`'s pid lookup - std's
-# `UnixStream::peer_cred()` is still gated behind the unstable
-# `peer_credentials_unix_socket` feature (confirmed by this project's
-# first real compile: E0658), so this goes straight to libc instead. A
-# thin, extremely stable FFI surface (`getsockopt`, `SOL_SOCKET`,
-# `SO_PEERCRED`, the `ucred` struct layout) that's been unchanged for
-# many years - much lower risk than depending on an unstable std feature
-# or guessing at a higher-level crate's version-specific API.
-libc = "0.2"
-hwde-ipc = { path = "hwde-ipc" }
-# Own-from-scratch protocol used only in `--extern-<name>` mode for every
-# target except `--extern-sde` (see src/extern_ipc.rs and src/main.rs's
-# module doc, and this crate's own module docs - `--extern-sde` itself
-# now speaks `wlr-foreign-toplevel-management-unstable-v1` instead, see
-# src/foreign_toplevel.rs). Independent of hwde-ipc on purpose - SDE is a
-# native Slint shell, not a Tauri webview. Every remaining
-# `--extern-<name>` target (hacker-mode, cybersecurity-mode, ...) speaks
-# this same wire protocol on its own socket; only the socket name differs
-# (see `sde_ipc::socket_path_for`). See `hacker-mode/` and
-# `cybersecurity-mode/` in this same workspace for those targets' own
-# reference copies of the client side of this protocol - the
-# `[[bin]] comphwde` built from THIS package does not depend on either of
-# them (`extern_ipc.rs` only implements the *server* side, generically,
-# for any `--extern-<name>` that isn't `sde`); they are workspace-local
-# sibling crates, not something this binary links against. See
-# `hacker-mode/src/lib.rs`'s and `cybersecurity-mode/src/lib.rs`'s module
-# docs for why Hacker Mode's (and, eventually, Cybersecurity Mode's)
-# actually shipped binaries use their own, separately-vendored copies of
-# it instead of depending on these workspace-local ones.
-sde-ipc = { path = "sde" }
-# HackerLand: comphwde's own window manager identity/protocol, exposed as
-# the `comphwde wm` subcommand - see wm/Cargo.toml's description (the
-# crate is named `hackerland`; it lives in this repo's `wm/` directory).
-# main.rs calls `hackerland::run()` for the CLI-client half
-# (`comphwde wm <subcommand>`); `src/hackerland_ipc.rs` is the server half
-# and depends on this crate too, for the shared wire-protocol types.
-hackerland = { path = "wm" }
-anyhow = "1"
-bitflags = "2.6"
-image = { version = "0.25", default-features = false, features = ["png"] }
-tracing = { version = "0.1", features = ["max_level_trace", "release_max_level_info"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-thiserror = "1"
-xkbcommon = "0.8"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-# Parses/writes ~/.config/HWDE/compositor.toml (see src/config.rs) - the
-# same file the shell's "Skróty klawiszowe" settings section reads/writes
-# (source-code/backend/src-tauri/src/commands/keybindings.rs).
-toml = "0.8"
-# Pure-Rust font rasterizer for SSD window title text - see
-# src/title_text.rs's module doc for why this crate specifically (no
-# system font-library linkage, i.e. no fontconfig/freetype dependency)
-# and what's/isn't verified about the exact API surface used.
-fontdue = "0.8"
-
-[dependencies.smithay]
-version = "0.7"
-default-features = false
-features = [
+wayland-scanner = "0.31"
+wayland-backend = "0.3"
+smithay = { git = "https://github.com/Smithay/smithay.git", rev = "82912edf", default-features = false, features = [
+    "backend_winit",
+    "backend_udev",
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "renderer_gl",
+    "renderer_multi",
+    "xwayland",
     "desktop",
     "wayland_frontend",
-    "backend_winit",
-    "backend_egl",
-    "backend_drm",
-    "renderer_gl",
-    "use_system_lib",
-    "xwayland",
-    "x11rb_event_source",
-]
+] }
 
-[dependencies.x11rb]
-version = "0.13"
-default-features = false
-features = ["composite"]
+wayland-protocols = { version = "0.31", features = ["server", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.2", features = ["server"] }
+wayland-server = "0.31"
+calloop = { version = "0.14", features = ["executor"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+nix = { version = "0.27", features = ["fs", "process", "signal"] }
+libc = "0.2"
+dirs = "5.0"
+chrono = "0.4"
+tempfile = "3"
+drm = "0.12"
 
-[features]
-default = ["xwayland", "drm-experimental"]
-# XWayland (Xorg compatibility) support - required for HackerOS's many
-# X11-only security/pentesting/gaming tools that don't speak Wayland yet.
-xwayland = []
-# Real DRM/udev/libseat/libinput backend for driving a display from a bare
-# TTY/SDDM login - see `backend_drm.rs`'s module doc. On by default (part
-# of `default` above) so a plain `cargo build --release` always includes
-# it; `main.rs` still only *activates* it at runtime when there's no
-# WAYLAND_DISPLAY/DISPLAY to nest inside of, so a normal desktop dev build
-# is unaffected either way. Disable explicitly with
-# `--no-default-features --features xwayland` if you need a build that
-# can't touch /dev/dri at all (e.g. a container without a DRM device).
-drm-experimental = [
-    "smithay/backend_udev",
-    "smithay/backend_session",
-    "smithay/backend_session_libseat",
-    "smithay/backend_libinput",
-    "smithay/backend_gbm",
-    "smithay/renderer_multi",
-]
-
-# This manifest is both `comphwde`'s own [package] *and* the workspace
-# root - a "mixed manifest", one of the two ways Cargo lets a root
-# crate's Cargo.toml double as its workspace's. `comphwde` itself is an
-# implicit workspace member (it's the package defined right here);
-# `members` below lists every other path-dependency crate that lives in
-# this repository (`hwde-ipc/` + `sde-ipc/`, `hacker-mode/`'s and
-# `cybersecurity-mode/`'s workspace-local reference copies, and `wm/` for
-# the `comphwde wm` subcommand), which otherwise wouldn't be part of the
-# workspace at all.
-[workspace]
-resolver = "2"
-members = [
-    "hwde-ipc",
-    "sde",
-    "hacker-mode",
-    "cybersecurity-mode",
-    "wm",
-]
-
-[profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-panic = "unwind"
-strip = true
-
-[profile.dev]
-opt-level = 0
+[patch.crates-io]
+calloop = { git = "https://github.com/Smithay/calloop.git", tag = "v0.14.0" }
