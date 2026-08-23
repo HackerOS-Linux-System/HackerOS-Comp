@@ -20,6 +20,13 @@ pub mod input_method;
 /// protocol, parametric path only. See module doc for scope + the
 /// verification caveat (never compiled with an MSRV-matching toolchain).
 pub mod color_management;
+/// `ext_workspace_v1` — lets an external panel/dock (a real Wayland
+/// client, not just the IPC-connected shell) list, activate, and watch
+/// this compositor's workspaces. Hand-vendored (same reasoning as
+/// color_management.rs: no upstream Rust bindings crate has it yet).
+/// See module doc for the scope this compositor's fixed-workspace-count
+/// model actually supports.
+pub mod ext_workspace;
 
 use smithay::{
     delegate_xdg_activation,
