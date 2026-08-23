@@ -17,7 +17,7 @@ pub type Clients = Arc<Mutex<Vec<UnixStream>>>;
 pub fn ipc_socket_path() -> PathBuf {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
         .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
-    PathBuf::from(runtime_dir).join("blue-compositor.sock")
+    PathBuf::from(runtime_dir).join("hackeros-comp.sock")
 }
 
 pub fn init_ipc(state: &mut BlueState, loop_handle: &LoopHandle<'static, BlueState>) {
