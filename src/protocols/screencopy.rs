@@ -292,3 +292,91 @@ pub fn service_screencopy(
     }
     screencopy.pending = remaining;
 }
+
+/// Pixman/software counterpart to `service_screencopy` above — same
+/// logic, duplicated rather than made generic over the renderer type.
+/// Deliberate, not an oversight: genericizing over `R: Renderer +
+/// ExportMem` here would mean guessing the exact associated-type bounds
+/// (`R`'s bound-target type, `ExportMem::TextureMapping`, `R::Error:
+/// Debug`, ...) with no compiler available to check them against —
+/// exactly the kind of unverifiable-generic-bound risk this codebase's
+/// established convention (see `render_udev_gles`/`render_udev_pixman`
+/// already being separate functions rather than one generic one, for
+/// the same reason) already treats as worth avoiding in favor of a
+/// second concrete copy. Keep both in sync by hand if the capture logic
+/// itself ever changes.
+pub fn service_screencopy_pixman(
+    screencopy: &mut ScreencopyState,
+    renderer: &mut smithay::backend::renderer::pixman::PixmanRenderer,
+    target: &smithay::backend::renderer::pixman::PixmanTarget<'_>,
+    output_name: &str,
+    output_size: (i32, i32),
+    damage: Option<&[smithay::utils::Rectangle<i32, smithay::utils::Physical>]>,
+) {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::ExportMem;
+    use smithay::utils::{Buffer as BufferCoord, Rectangle};
+
+    let has_real_damage = damage.map(|d| !d.is_empty()).unwrap_or(false);
+
+    let mut remaining = VecDeque::new();
+    while let Some(pending) = screencopy.pending.pop_front() {
+        if pending.output_name != output_name {
+            remaining.push_back(pending);
+            continue;
+        }
+        if pending.with_damage && !has_real_damage {
+            remaining.push_back(pending);
+            continue;
+        }
+
+        let region: Rectangle<i32, BufferCoord> =
+            Rectangle::new((0, 0).into(), (output_size.0, output_size.1).into());
+
+        let mapping = match renderer.copy_framebuffer(target, region, Fourcc::Argb8888) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("screencopy (pixman): copy_framebuffer failed: {:?}", e);
+                pending.frame.failed();
+                continue;
+            }
+        };
+        let pixels: &[u8] = match renderer.map_texture(&mapping) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("screencopy (pixman): map_texture failed: {:?}", e);
+                pending.frame.failed();
+                continue;
+            }
+        };
+
+        let copy_ok = smithay::wayland::shm::with_buffer_contents_mut(
+            &pending.buffer,
+            |ptr: *mut u8, len: usize, _shm_info: smithay::wayland::shm::BufferData| {
+                let shm_data = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+                let copy_len = pixels.len().min(shm_data.len());
+                shm_data[..copy_len].copy_from_slice(&pixels[..copy_len]);
+            },
+        )
+        .is_ok();
+
+        if copy_ok {
+            pending.frame.flags(zwlr_screencopy_frame_v1::Flags::empty());
+            if pending.with_damage {
+                if let Some(rects) = damage {
+                    for r in rects {
+                        pending.frame.damage(r.loc.x as u32, r.loc.y as u32, r.size.w as u32, r.size.h as u32);
+                    }
+                }
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = now.as_secs();
+            pending.frame.ready((secs >> 32) as u32, secs as u32, now.subsec_nanos());
+        } else {
+            pending.frame.failed();
+        }
+    }
+    screencopy.pending = remaining;
+}
