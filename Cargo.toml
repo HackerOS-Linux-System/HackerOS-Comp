@@ -1,8 +1,12 @@
 [package]
 name = "hackeros-comp"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2021"
-description = "HackerOS Compositor — Production Wayland Compositor (Smithay)"
+description = "Blue Environment — Production Wayland Compositor (Smithay)"
+
+[[bin]]
+name = "hackeros-comp"
+path = "src/main.rs"
 
 # `wp_color_management_v1` landed in upstream wayland-protocols on
 # 2025-02-13 (release 1.41) and, as of this writing, still has no bindings
@@ -32,6 +36,40 @@ description = "HackerOS Compositor — Production Wayland Compositor (Smithay)"
 [dependencies]
 wayland-scanner = "0.31"
 wayland-backend = "0.3"
+# EIS/libei input-emulation server — see src/input_emulation/mod.rs's
+# module doc for exactly what this covers (the EIS transport itself,
+# not the xdg-desktop-portal RemoteDesktop D-Bus service that would
+# normally hand a real portal-mediated client this socket's fd).
+# `calloop` feature: integrates with this project's existing calloop
+# event loop rather than needing its own polling thread — pinned to the
+# same calloop major version (0.14) already used elsewhere in this
+# Cargo.toml, per reis's own published dependency info.
+reis = { version = "0.7", features = ["calloop"] }
+# `wayland-scanner`'s `generate_server_code!` macro (used directly in this
+# crate's source by `src/protocols/ext_workspace.rs` — see that file's
+# header comment) emits `bitflags::bitflags! { ... }` for every XML enum
+# marked `bitfield="true"` (checked directly against
+# `wayland-scanner-0.31.6`'s own source, `src/common.rs`'s
+# `impl ToTokens for Enum`). `ext-workspace-v1.xml` has three such enums
+# (`group_capabilities`, `state`, `workspace_capabilities`) — the XML
+# itself vendored via the `wayland-protocols` crate on crates.io, per the
+# provenance note in `ext_workspace.rs`. Exactly like `wayland-backend`
+# above, that generated code references `bitflags::bitflags!` by direct
+# crate path, which only resolves if `bitflags` is a *direct* dependency
+# of this crate (the extern prelude doesn't expose transitive deps under
+# their own name) — this was previously missing entirely, which is why
+# `cargo build` failed with "use of unresolved module or unlinked crate
+# `bitflags`" at the `generate_server_code!` call site, and every type
+# the bitfield branch would have defined (`State`,
+# `GroupCapabilities`/`WorkspaceCapabilities`) then didn't exist either,
+# cascading into the `E0425`/`E0433` "not found in this scope" errors at
+# every call site in `ext_workspace.rs` that referenced them. Pinned to
+# major version 2 (the macro syntax `generate_server_code!` emits —
+# `pub struct Name: u32 { const Variant = value; }` inside the
+# `bitflags!` invocation — is unchanged from bitflags 1.x, so 2.x is a
+# deliberate choice for the current ecosystem default, not a
+# compatibility requirement).
+bitflags = "2"
 smithay = { git = "https://github.com/Smithay/smithay.git", rev = "82912edf", default-features = false, features = [
     "backend_winit",
     "backend_udev",
@@ -39,12 +77,61 @@ smithay = { git = "https://github.com/Smithay/smithay.git", rev = "82912edf", de
     "backend_gbm",
     "backend_libinput",
     "backend_session_libseat",
+    "backend_egl",
+    "backend_vulkan",
     "renderer_gl",
+    "renderer_glow",
+    "renderer_pixman",
     "renderer_multi",
     "xwayland",
     "desktop",
     "wayland_frontend",
 ] }
+# ── Feature notes (verified against the pinned rev's own Cargo.toml —
+# `smithay-82912edf.../Cargo.toml`'s `[features]` section, fetched and
+# read directly, not recalled) ──────────────────────────────────────────
+# - `backend_egl` — smithay's own `renderer_gl = ["gl_generator",
+#   "backend_egl"]` already pulls this in transitively; listed
+#   explicitly anyway so it reads as a first-class capability of this
+#   build rather than an implicit side effect someone has to go
+#   discover by reading smithay's feature graph.
+# - `backend_vulkan` — pulls in `ash`/`scopeguard` (smithay's own
+#   dependency graph handles that; nothing added to *this* crate's own
+#   `[dependencies]` for it). Unlocks `backend::vulkan` (device
+#   enumeration, `VulkanAllocator` for a DRM/GBM-independent dmabuf
+#   allocation path). Not wired into anything in this codebase yet —
+#   `render/mod.rs` still allocates exclusively via GBM. A real Vulkan
+#   render path (replacing or sitting alongside the GLES one) is a
+#   substantial follow-up, not a flag-flip.
+# - `renderer_pixman` — pulls in the `pixman` crate. Unlocks
+#   `backend::renderer::pixman::PixmanRenderer`, a CPU-only software
+#   renderer with no GPU/EGL dependency at all — the natural fallback
+#   for a headless VM with no GPU passthrough, or for debugging a
+#   render-correctness issue independent of any GPU driver. Not wired
+#   into the udev/winit backend selection yet (see render/mod.rs's
+#   `init_udev`/`init_winit` — both still assume a GLES-capable GPU is
+#   always available); a real "no usable GPU found → fall back to
+#   Pixman" path is real, valuable follow-up work, not attempted here
+#   without a compiler to verify the renderer-selection branch against.
+# - `renderer_glow` — see `render/mod.rs`'s module-level note on why
+#   this is *additive*, not a replacement for `renderer_gl` (the two
+#   aren't interchangeable at the type level in this codebase's current
+#   architecture — `GlowFrame` doesn't re-expose the GLES-specific
+#   `override_default_tex_program` API the HDR tone-mapping wrapper in
+#   `hdr_shader.rs` depends on).
+# - `backend_libei` — **does not exist in this pinned smithay rev.**
+#   Checked directly: `grep -rn libei` across the entire fetched
+#   `smithay-82912edf...` source tree (Cargo.toml + all of `src/`)
+#   returns zero matches. `libei` (the actual C library, used by
+#   `xdg-desktop-portal`'s RemoteDesktop portal for input emulation
+#   under Wayland) isn't wrapped by this version of smithay at all —
+#   adding a Cargo feature string that doesn't exist would make `cargo
+#   build` fail immediately with an unresolved-feature error, which is
+#   strictly worse than not adding it. Genuine input-emulation-portal
+#   support would need either a newer smithay release (if one adds
+#   it — not confirmed) or a separate, hand-rolled libei integration
+#   outside smithay's feature graph entirely. Left out, honestly, not
+#   guessed at.
 
 wayland-protocols = { version = "0.31", features = ["server", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.2", features = ["server"] }
@@ -60,7 +147,20 @@ libc = "0.2"
 dirs = "5.0"
 chrono = "0.4"
 tempfile = "3"
-drm = "0.12"
+# NOTE: a direct `drm = "0.12"` dependency used to be here. Removed —
+# a real `cargo build` failed with "the trait `Buffer` is not
+# implemented for `DumbBuffer`" plus a "multiple different versions of
+# crate `drm` in the dependency graph" note, because this pin (0.12)
+# didn't match the `drm ^0.14` smithay's own git checkout uses
+# internally, so Cargo kept two separate copies of the crate around and
+# `smithay::reexports::drm::...` types (built against 0.14) stopped
+# being interchangeable with anything built against a directly-resolved
+# 0.12. Nothing in this codebase imports `drm::` directly (every use is
+# `smithay::reexports::drm::...` — checked, no bare `use drm::` anywhere
+# in `src/`), so this pin was both unused and actively harmful. If a
+# direct `drm` dependency is ever genuinely needed again, pin it to
+# match whatever version smithay's own `Cargo.lock` resolves to at the
+# time, not an independently-chosen version.
 
 [patch.crates-io]
 calloop = { git = "https://github.com/Smithay/calloop.git", tag = "v0.14.0" }
