@@ -1,5 +1,6 @@
 mod state;
 mod input;
+mod input_emulation;
 mod render;
 mod ipc;
 mod xwayland;
@@ -13,7 +14,7 @@ use std::fs;
 
 /// Single fixed-path log file, not a fresh timestamped file per run
 /// (what this used to do — see the git history) — requested so both
-/// `blue-compositor.log` and `blue-environment.log` (the shell's, see
+/// `hackeros-comp.log` and `blue-environment.log` (the shell's, see
 /// Blue-Environment's `logging.rs`) sit next to each other in one place
 /// a user can `tail -f` without hunting for the latest timestamp.
 ///
@@ -24,7 +25,7 @@ use std::fs;
 /// `chown`'d it to the user, e.g. via a packaged tmpfiles.d rule or
 /// install script), falls back to the old per-user cache location
 /// instead of crashing the compositor over a log path. Either way the
-/// *filename* is now fixed (`blue-compositor.log`, appended across
+/// *filename* is now fixed (`hackeros-comp.log`, appended across
 /// runs) rather than timestamped.
 fn log_file_path() -> std::path::PathBuf {
     let system_dir = std::path::PathBuf::from("/var/log/Blue-Environment");
@@ -48,13 +49,13 @@ fn init_logging() -> tracing_appender::non_blocking::WorkerGuard {
     let log_dir = log_file_path();
     let using_system_path = log_dir.starts_with("/var/log");
 
-    let file_appender = tracing_appender::rolling::never(&log_dir, "blue-compositor.log");
+    let file_appender = tracing_appender::rolling::never(&log_dir, "hackeros-comp.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let subscriber = fmt::Subscriber::builder()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("blue_compositor=info,smithay=warn")),
+                .unwrap_or_else(|_| EnvFilter::new("hackeros_comp=info,smithay=warn")),
         )
         .with_writer(non_blocking)
         .with_ansi(false)
@@ -74,10 +75,10 @@ fn init_logging() -> tracing_appender::non_blocking::WorkerGuard {
         .expect("no other tracing subscriber should be installed before init_logging() runs");
 
     if using_system_path {
-        info!("Logging to {}/blue-compositor.log", log_dir.display());
+        info!("Logging to {}/hackeros-comp.log", log_dir.display());
     } else {
         warn!(
-            "/var/log/Blue-Environment not writable by this user — logging to {}/blue-compositor.log instead. \
+            "/var/log/Blue-Environment not writable by this user — logging to {}/hackeros-comp.log instead. \
              To use the system path, pre-create it writable by this user, e.g.: \
              sudo install -d -m 0775 -o $USER -g $USER /var/log/Blue-Environment",
             log_dir.display()
@@ -112,7 +113,7 @@ fn main() {
     // the non-blocking writer), hence binding it here instead of
     // discarding it.
     let _log_guard = init_logging();
-    info!("Blue Compositor v0.2 starting...");
+    info!("HackerOS-Comp v0.2 starting...");
 
     if let Err(e) = write_desktop_file() {
         warn!("Could not write desktop file: {}", e);
@@ -211,6 +212,15 @@ fn run_udev() {
 
     st.init_ipc(&loop_handle);
 
+    // EIS input-emulation socket — see input_emulation module doc for
+    // scope (real EIS transport, no D-Bus portal service yet). Not
+    // fatal if it fails (e.g. no writable XDG_RUNTIME_DIR in some
+    // exotic sandbox) — the rest of the compositor works fine without
+    // it, this is strictly additive.
+    if let Err(e) = input_emulation::init(&mut st, &loop_handle) {
+        warn!("EIS input-emulation socket failed to start (remote-input clients won't be able to connect): {e}");
+    }
+
     // Idle / DPMS timer
     protocols::idle::init_idle(&st, &loop_handle);
 
@@ -244,9 +254,59 @@ fn run_winit() {
     let loop_handle = event_loop.handle();
     let mut st = state::BlueState::new(&loop_handle, display);
 
+    // `winit::init` always builds an EGL context against the *host*
+    // GL/GLES driver stack (checked against smithay's own
+    // `backend::winit` source at the pinned rev — it creates a raw
+    // window and immediately wraps it in an `EGLDisplay`/`EGLContext`,
+    // there's no non-EGL code path in it at all), so unlike the udev/TTY
+    // backend there is no "hand-roll a Pixman-and-dumb-buffers path
+    // instead" fallback available here — there's no DRM/KMS device to
+    // allocate dumb buffers on in the first place, only a host window.
+    // The real, working GPU-less fallback for *this* backend is a
+    // software GL driver satisfying the same EGL/GLES2 API winit already
+    // asks for — Mesa's llvmpipe, opted into via `LIBGL_ALWAYS_SOFTWARE`
+    // (this is the standard, well-known way to get a nested
+    // Wayland/X11 compositor running in a GPU-less CI runner or VM; not
+    // specific to this codebase).
+    //
+    // Only kicks in on the first attempt's failure, and only if the
+    // variable wasn't already set to something (so an explicit
+    // `LIBGL_ALWAYS_SOFTWARE=0` from the person running this to force
+    // *real* GPU use and get a clear error instead of a silent
+    // llvmpipe fallback is respected, not overridden).
     let (winit_backend, winit_evt) =
-        winit::init::<smithay::backend::renderer::gles::GlesRenderer>()
-            .expect("Failed to init winit backend");
+        match winit::init::<smithay::backend::renderer::gles::GlesRenderer>() {
+            Ok(pair) => pair,
+            Err(e) if std::env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none() => {
+                warn!(
+                    "winit backend init failed ({e}) — retrying with Mesa's llvmpipe \
+                     software rasterizer (LIBGL_ALWAYS_SOFTWARE=1); this is expected on \
+                     a GPU-less host (CI runner, VM without GPU passthrough) and will \
+                     work, just noticeably slower than real GPU acceleration"
+                );
+                std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+                match winit::init::<smithay::backend::renderer::gles::GlesRenderer>() {
+                    Ok(pair) => pair,
+                    Err(e2) => {
+                        error!(
+                            "winit backend init still failed after forcing llvmpipe ({e2}) — \
+                             this host likely has no usable GL/GLES driver at all (not even \
+                             software), or no host Wayland/X11 display to nest inside \
+                             (WAYLAND_DISPLAY/DISPLAY unset?). Original error: {e}"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Err(e) => {
+                error!(
+                    "winit backend init failed ({e}) and LIBGL_ALWAYS_SOFTWARE is already \
+                     set, so not retrying with a different value — unset it to allow an \
+                     automatic software-rendering fallback"
+                );
+                std::process::exit(1);
+            }
+        };
 
     st.init_winit(winit_backend, winit_evt, &loop_handle);
 
@@ -255,6 +315,15 @@ fn run_winit() {
     }
 
     st.init_ipc(&loop_handle);
+
+    // EIS input-emulation socket — see input_emulation module doc for
+    // scope (real EIS transport, no D-Bus portal service yet). Not
+    // fatal if it fails (e.g. no writable XDG_RUNTIME_DIR in some
+    // exotic sandbox) — the rest of the compositor works fine without
+    // it, this is strictly additive.
+    if let Err(e) = input_emulation::init(&mut st, &loop_handle) {
+        warn!("EIS input-emulation socket failed to start (remote-input clients won't be able to connect): {e}");
+    }
 
     // Idle / DPMS timer
     protocols::idle::init_idle(&st, &loop_handle);
@@ -293,5 +362,5 @@ fn run_loop(
         }
     }
 
-    info!("Blue Compositor stopped");
+    info!("HackerOS-Comp stopped");
 }
