@@ -143,7 +143,7 @@ pub fn handle_shell_message(state: &mut BlueState, msg: ShellMessage) {
             let clients = state.clients.clone();
             // Previously "focused" mode shelled out to `swaymsg -t
             // get_tree | jq ...` — that's sway's own IPC protocol, which
-            // Blue Compositor does not (and will never) implement, so
+            // HackerOS-Comp does not (and will never) implement, so
             // this branch was guaranteed to fail on every single
             // invocation, silently falling through to the `grim`
             // (full-output) fallback below it. Compute the focused
