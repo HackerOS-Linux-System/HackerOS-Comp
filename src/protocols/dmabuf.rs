@@ -167,7 +167,13 @@ impl DmabufHandler for BlueState {
             return None; // already what the default feedback targets
         }
         let gpu = udev.devices.get(&node)?;
-        let renderer = gpu.renderer.as_ref()?;
+        // dmabuf import is a GLES/EGL-specific capability (see this
+        // file's module doc) — a GPU that fell back to the software
+        // Pixman renderer (`state::RenderBackend`) has no dmabuf
+        // formats to report at all, so this falls back to the global
+        // default feedback for it, same as the `formats.is_empty()`
+        // case just below already does for any other reason.
+        let renderer = gpu.renderer.as_ref().and_then(crate::state::RenderBackend::as_gles)?;
         let formats: Vec<Format> = renderer.dmabuf_formats().into_iter().collect();
         if formats.is_empty() {
             return None;
