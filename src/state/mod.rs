@@ -3,6 +3,7 @@ use smithay::{
     delegate_compositor, delegate_data_device, delegate_fractional_scale,
     delegate_layer_shell, delegate_output, delegate_presentation,
     delegate_primary_selection, delegate_seat, delegate_shm,
+    delegate_single_pixel_buffer, delegate_content_type,
     delegate_viewporter, delegate_xdg_shell,
     delegate_pointer_constraints, delegate_relative_pointer,
     delegate_tablet_manager, delegate_text_input_manager, delegate_input_method_manager,
@@ -112,13 +113,70 @@ pub struct UdevData {
     pub gpu_manager: smithay::backend::renderer::multigpu::GpuManager<crate::render::multigpu::Backend>,
 }
 
+/// Which render path a given GPU ended up on. `Gles` is the normal case
+/// (a real GPU with a working EGL/GBM driver stack); `Pixman` is the
+/// software fallback for the case that motivated adding this enum at
+/// all — a headless VM / CI runner with a KMS-capable display controller
+/// (`vkms`, QEMU's `bochs-drm`/`virtio-gpu` in software mode, ...) but no
+/// GPU driver capable of EGL context creation, where the previous
+/// "GLES or nothing" code left `GpuDevice::renderer` permanently `None`
+/// and every output on it silently never rendered (see
+/// `scan_drm_outputs`'s `warn!("No renderer available...")`, which used
+/// to be the end of the story).
+///
+/// Deliberately a real enum over the renderer type rather than trying to
+/// make `GpuDevice`/`OutputRenderSurface`/`render_udev` generic over
+/// `R: Renderer` — `GlesRenderer` and `PixmanRenderer` don't share a
+/// buffer-import story simple enough to unify here (GLES imports GBM
+/// dma-bufs via EGL; Pixman renders into plain mapped CPU memory), and
+/// `hdr_shader.rs`'s `HdrAwareElement` is GLES-specific already (see
+/// this file's module doc), so a generic `GpuDevice<R>` would still need
+/// to special-case the GLES arm for HDR anyway. Matching smithay's own
+/// reference compositor (`anvil`), which draws this exact same
+/// distinction with its own `Either`-shaped renderer/surface types, not
+/// a novel design.
+pub enum RenderBackend {
+    Gles(smithay::backend::renderer::gles::GlesRenderer),
+    Pixman(smithay::backend::renderer::pixman::PixmanRenderer),
+}
+
+impl RenderBackend {
+    pub fn is_software(&self) -> bool {
+        matches!(self, RenderBackend::Pixman(_))
+    }
+
+    pub fn as_gles(&self) -> Option<&smithay::backend::renderer::gles::GlesRenderer> {
+        match self {
+            RenderBackend::Gles(r) => Some(r),
+            RenderBackend::Pixman(_) => None,
+        }
+    }
+
+    pub fn as_gles_mut(&mut self) -> Option<&mut smithay::backend::renderer::gles::GlesRenderer> {
+        match self {
+            RenderBackend::Gles(r) => Some(r),
+            RenderBackend::Pixman(_) => None,
+        }
+    }
+
+    pub fn as_pixman_mut(&mut self) -> Option<&mut smithay::backend::renderer::pixman::PixmanRenderer> {
+        match self {
+            RenderBackend::Pixman(r) => Some(r),
+            RenderBackend::Gles(_) => None,
+        }
+    }
+}
+
 pub struct GpuDevice {
     pub drm: smithay::backend::drm::DrmDevice,
     pub gbm: smithay::backend::allocator::gbm::GbmDevice<smithay::backend::drm::DrmDeviceFd>,
-    /// Shared EGL/GLES context for this GPU. `None` until the first
-    /// `scan_drm_outputs()` call successfully creates it (EGL init needs
-    /// at least one open GBM device, which we already have by then).
-    pub renderer: Option<smithay::backend::renderer::gles::GlesRenderer>,
+    /// Shared renderer context for this GPU — `Gles` on the normal path,
+    /// `Pixman` when no usable GPU/EGL driver was found for this DRM
+    /// node (see `RenderBackend`'s doc). `None` until the first
+    /// `scan_drm_outputs()` call successfully creates one (renderer
+    /// creation needs at least one open GBM device, which we already
+    /// have by then).
+    pub renderer: Option<RenderBackend>,
     /// HDR tone-mapping shader, compiled once for this GPU's GL context
     /// right after `renderer` is created — see `render/hdr_shader.rs`'s
     /// module doc for why it's compiled-and-ready but not yet called
@@ -165,12 +223,121 @@ pub struct GpuDevice {
 /// attempted here since both touch the render/commit hot path, which is
 /// exactly what most needs a real `cargo build` and a second GPU to
 /// verify against (see ROADMAP.md).
-pub struct OutputRenderSurface {
-    pub output: Output,
-    pub gbm_surface: smithay::backend::drm::GbmBufferedSurface<
+/// A minimal, hand-rolled double-buffered dumb-buffer swapchain — the
+/// Pixman-path counterpart to `GbmBufferedSurface` on the GLES path.
+/// `DumbBuffer`/`add_framebuffer`/`map_dumb_buffer`/`page_flip` are all
+/// plain DRM/KMS ioctls (via the `drm` crate's `control::Device` trait),
+/// available on *any* KMS device including GPU-less ones (`vkms`,
+/// virtualized display controllers) — that universality, at the cost of
+/// no GPU acceleration at all, is the entire point of this path existing.
+///
+/// No smithay type does this bookkeeping for us the way
+/// `GbmBufferedSurface` does for the GBM/EGL path — this pinned smithay
+/// rev's dumb-buffer support is the raw `DumbBuffer` allocator type, not
+/// a ready-made swapchain, so front/back tracking and the page-flip wait
+/// are done by hand here, mirroring what `GbmBufferedSurface` does
+/// internally (checked directly against that type's own source at the
+/// pinned rev) rather than inventing a new scheme.
+pub struct DumbSwapchain {
+    /// This path deliberately bypasses smithay's `DrmSurface` (the
+    /// atomic-KMS abstraction `GbmBufferedSurface` drives on the GLES
+    /// path) and talks to the raw `drm::control::Device` legacy
+    /// `set_crtc`/`page_flip` ioctls directly on the shared `DrmDevice`
+    /// instead — `DrmSurface` is built around committing GBM-backed
+    /// planes and doesn't have an equivalent "just point this CRTC at
+    /// this plain dumb-buffer framebuffer" entry point. The CRTC and
+    /// connector handles are kept here (rather than a `DrmSurface`)
+    /// because the raw `page_flip`/`set_crtc` calls need them passed
+    /// explicitly on every call.
+    pub crtc: smithay::reexports::drm::control::crtc::Handle,
+    pub connector: smithay::reexports::drm::control::connector::Handle,
+    /// Two buffers, each already wrapped in a KMS framebuffer id via
+    /// `add_framebuffer` — index `front` is on-screen (or was, as of the
+    /// last completed page-flip); rendering always targets `1 - front`.
+    pub buffers: [DumbSwapchainBuffer; 2],
+    pub front: usize,
+}
+
+pub struct DumbSwapchainBuffer {
+    /// The *raw* `drm`-crate dumb buffer (via
+    /// `smithay::reexports::drm`, not a second, independently-pinned
+    /// `drm` dependency of this crate's own — an earlier version of
+    /// this file's Cargo.toml had exactly that, at a mismatched version
+    /// from what smithay's own git checkout uses, which is a real bug a
+    /// `cargo build` caught: two incompatible copies of the same crate
+    /// in the dependency graph, so types built against one didn't
+    /// satisfy trait bounds written against the other). This is the
+    /// type `drm.add_framebuffer`/`set_crtc`/`page_flip` all need — see
+    /// `render_udev_pixman`'s doc for how this same buffer's memory
+    /// also gets mapped and wrapped in a `pixman::Image` for
+    /// `PixmanRenderer::bind`, which is a *different* type need served
+    /// from the same underlying allocation, not something this field's
+    /// type itself has to satisfy.
+    pub dumb: smithay::reexports::drm::control::dumbbuffer::DumbBuffer,
+    pub fb: smithay::reexports::drm::control::framebuffer::Handle,
+    /// Whether this buffer has ever been rendered into before — used to
+    /// derive its `OutputDamageTracker` buffer age (see
+    /// `DumbSwapchain::back_age`'s doc for why "ever rendered" is the
+    /// only bit of history this swapchain needs to track, rather than a
+    /// real per-frame counter).
+    pub ever_rendered: bool,
+}
+
+impl DumbSwapchain {
+    /// The buffer the next frame should be rendered into.
+    pub fn back_mut(&mut self) -> &mut DumbSwapchainBuffer {
+        &mut self.buffers[1 - self.front]
+    }
+
+    /// The buffer-age value to pass as `OutputDamageTracker::render_
+    /// output`'s `age` parameter for whatever's about to be rendered
+    /// into the back buffer (was: always hardcoded `0`, i.e. "unknown,
+    /// redraw everything, every frame" — correct but needlessly
+    /// expensive on exactly the software-rendering path that can least
+    /// afford full-frame redraws every frame).
+    ///
+    /// `0` (full redraw needed) the first two times a given buffer is
+    /// used — swapchain starts with two freshly-allocated, contentless
+    /// buffers, so there's nothing to accumulate damage against yet.
+    /// `2` every time after that, unconditionally — *not* a real
+    /// per-frame-tracked age counter, because this is deliberately a
+    /// strict, non-skipping double buffer (`render_udev_pixman` renders
+    /// and flips exactly once per output-render tick, no triple
+    /// buffering, no dropped frames): with only two buffers strictly
+    /// alternating, by the time either one is reused as a render target
+    /// again it is *always* exactly two frames stale relative to "now"
+    /// — this isn't an approximation of the real age, it's what the
+    /// real age always evaluates to for this specific swapchain shape.
+    /// (Contrast with the GBM path's `GbmBufferedSurface::next_buffer()`,
+    /// which reports a real per-call age because *that* swapchain can
+    /// have more than two buffers and doesn't guarantee strict
+    /// alternation.)
+    pub fn back_age(&self) -> usize {
+        if self.buffers[1 - self.front].ever_rendered { 2 } else { 0 }
+    }
+}
+
+/// Which physical swapchain this output's surface uses — `Gbm` on the
+/// normal GLES/hardware-accelerated path, `Dumb` when the owning
+/// `GpuDevice::renderer` fell back to `RenderBackend::Pixman` (see that
+/// enum's doc for why/when). The two are mutually exclusive per-GPU in
+/// practice — `scan_drm_outputs` picks one `RenderBackend` for the whole
+/// device and every surface on it follows — but this is still a real
+/// enum (not e.g. an `Option<GbmBufferedSurface>` alongside an
+/// `Option<DumbSwapchain>`) so `render_udev` can `match` exhaustively
+/// instead of juggling two independently-optional fields that are
+/// actually never both `Some`/both `None` by construction.
+pub enum SurfaceBackend {
+    Gbm(smithay::backend::drm::GbmBufferedSurface<
         smithay::backend::allocator::gbm::GbmAllocator<smithay::backend::drm::DrmDeviceFd>,
         (),
-    >,
+    >),
+    Dumb(DumbSwapchain),
+}
+
+pub struct OutputRenderSurface {
+    pub output: Output,
+    pub surface: SurfaceBackend,
     pub damage_tracker: smithay::backend::renderer::damage::OutputDamageTracker,
     /// The connector this surface is currently driving — needed to
     /// rebuild the `DrmSurface` (via `drm.create_surface(crtc, mode,
@@ -267,6 +434,39 @@ pub struct BlueState {
     /// it can't happen inside `BlueState::new()` like most other globals
     /// here — it's called once the winit/udev backend has a renderer).
     pub dmabuf_state: Option<smithay::wayland::dmabuf::DmabufState>,
+    /// `wp_single_pixel_buffer_v1` — lets a client create a 1x1 solid-color
+    /// buffer without allocating shm/dmabuf memory for it. Trivial but
+    /// real: toolkits (GTK4, Qt6) use this for solid-color fills/
+    /// backgrounds/borders instead of a wasteful shm buffer, and its
+    /// absence as a global is something a toolkit can and does detect
+    /// (falls back to shm, which works fine, just less efficiently — so
+    /// this isn't fixing broken behavior, it's closing a real, if minor,
+    /// feature gap against compositors like cosmic-comp/KWin/Mutter that
+    /// already advertise it). See main.rs's init for where this is
+    /// created. Full API verified directly against the vendored smithay
+    /// source (`wayland::single_pixel_buffer` — a complete, ready-to-use
+    /// module, not something built from protocol XML by hand like
+    /// color-management): renderer-level import support already exists
+    /// in `backend::renderer::mod.rs`, so registering this global is the
+    /// entire integration — no render-loop changes needed.
+    pub single_pixel_buffer_state: smithay::wayland::single_pixel_buffer::SinglePixelBufferState,
+    /// `wp_content_type_v1` — lets a client (video players, games) hint
+    /// what kind of content a surface shows, queryable later via
+    /// `ContentTypeSurfaceCachedState::content_type()` in `compositor::
+    /// with_states`. Not read anywhere yet (no VRR/adaptive-sync or
+    /// power-saving behavior branches on it today) — registering the
+    /// global is still real forward progress on its own, the same
+    /// "advertise the negotiation honestly" reasoning already applied to
+    /// `wp_color_management_v1` in `color_management.rs`: a toolkit can
+    /// start sending this hint now, and reading it back is a
+    /// self-contained follow-up (see ROADMAP.md).
+    pub content_type_state: smithay::wayland::content_type::ContentTypeState,
+    /// `ext_workspace_v1` — see `protocols/ext_workspace.rs`'s module
+    /// doc for what this compositor's fixed-workspace-count model maps
+    /// onto it, and for the XML's provenance (fetched from the
+    /// `wayland-protocols` crate on crates.io, since gitlab.freedesktop.org
+    /// itself isn't reachable from this environment).
+    pub ext_workspace_state: crate::protocols::ext_workspace::ExtWorkspaceState,
     pub dmabuf_global: Option<smithay::wayland::dmabuf::DmabufGlobal>,
     /// `wp_color_management_v1` — see protocols/color_management.rs.
     pub color_management_state: crate::protocols::color_management::ColorManagementState,
@@ -308,6 +508,13 @@ pub struct BlueState {
     pub cursor_status: Arc<Mutex<CursorImageStatus>>,
     pub outputs: Vec<Output>,
     pub output_configs: Vec<OutputConfig>,
+
+    /// `None` until `input_emulation::init()` runs (called from both
+    /// backends' startup in `main.rs`); see that module's doc for what
+    /// this actually is (an EIS/libei input-emulation server) and what
+    /// it deliberately doesn't cover yet (the xdg-desktop-portal
+    /// RemoteDesktop D-Bus service).
+    pub eis_state: Option<crate::input_emulation::EisServerState>,
 
     // XWayland
     pub xwayland:             Option<XWayland>,
@@ -401,6 +608,9 @@ impl BlueState {
         let foreign_toplevel_state = crate::protocols::foreign_toplevel::ForeignToplevelManagerState::new(&display_handle);
         let output_management_state = crate::protocols::output_management::OutputManagementState::new(&display_handle);
         let screencopy_state = crate::protocols::screencopy::ScreencopyState::new(&display_handle);
+        let single_pixel_buffer_state = smithay::wayland::single_pixel_buffer::SinglePixelBufferState::new::<Self>(&display_handle);
+        let content_type_state = smithay::wayland::content_type::ContentTypeState::new::<Self>(&display_handle);
+        let ext_workspace_state = crate::protocols::ext_workspace::init_ext_workspace(&display_handle);
 
         // Create Wayland socket
         let socket = ListeningSocketSource::new_auto()
@@ -452,6 +662,9 @@ impl BlueState {
             input_method_manager_state,
             input_method_popups: Vec::new(),
             dmabuf_state: None,
+            single_pixel_buffer_state,
+            content_type_state,
+            ext_workspace_state,
             dmabuf_global: None,
             color_management_state: crate::protocols::color_management::ColorManagementState::default(),
             surface_gpu_origin: HashMap::new(),
@@ -467,6 +680,7 @@ impl BlueState {
             cursor_status: Arc::new(Mutex::new(CursorImageStatus::default_named())),
             outputs: Vec::new(),
             output_configs: Vec::new(),
+            eis_state: None,
             xwayland:             None,
             xwm:                  None,
             x11_display:          None,
@@ -727,7 +941,8 @@ impl BlueState {
 
     pub fn switch_workspace(&mut self, index: usize) {
         let next = index.min(self.workspace_count - 1);
-        info!("Switching workspace {} -> {}", self.current_workspace, next);
+        let previous = self.current_workspace;
+        info!("Switching workspace {} -> {}", previous, next);
         self.current_workspace = next;
 
         // Hide windows not on current workspace by moving them off-screen
@@ -747,6 +962,16 @@ impl BlueState {
             }
             // In Smithay Space there's no show/hide, so we rely on
             // the shell frontend to handle workspace visibility
+        }
+
+        // Real Wayland clients (a panel/dock bound to `ext_workspace_v1`,
+        // not just the IPC-connected shell) need to hear about this too
+        // — see protocols/ext_workspace.rs's module doc. No-op if
+        // nothing's bound the global (the common case today, since no
+        // shipped Blue Environment component is itself a separate
+        // Wayland client yet — it talks to this compositor over IPC).
+        if previous != next {
+            crate::protocols::ext_workspace::notify_workspace_switched(self, previous, next);
         }
     }
 }
@@ -1099,6 +1324,8 @@ delegate_input_method_manager!(BlueState);
 
 delegate_compositor!(BlueState);
 delegate_shm!(BlueState);
+delegate_single_pixel_buffer!(BlueState);
+delegate_content_type!(BlueState);
 delegate_seat!(BlueState);
 delegate_xdg_shell!(BlueState);
 delegate_layer_shell!(BlueState);
