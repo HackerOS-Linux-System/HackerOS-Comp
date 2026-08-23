@@ -1,4 +1,4 @@
-# comphwde
+# HackerOS Compositor
 
 Smithay-based Wayland/XWayland compositor for HackerOS.
 
