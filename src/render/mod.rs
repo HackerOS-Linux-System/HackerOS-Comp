@@ -2,6 +2,7 @@ use smithay::{
     backend::{
         allocator::{
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
+            Fourcc,
         },
         drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, GbmBufferedSurface},
         egl::{EGLContext, EGLDevice, EGLDisplay},
@@ -12,7 +13,8 @@ use smithay::{
             },
             gles::GlesRenderer,
             multigpu::{gbm::GbmGlesBackend, GpuManager},
-            Bind,
+            pixman::PixmanRenderer,
+            Bind, ImportDma,
         },
         session::{Session, libseat::LibSeatSession},
         udev::{all_gpus, primary_gpu, UdevBackend, UdevEvent},
@@ -22,14 +24,32 @@ use smithay::{
     reexports::{
         calloop::{LoopHandle, timer::{Timer, TimeoutAction}},
         rustix::fs::OFlags,
-        drm::control::{connector, crtc, Device as DrmControlDevice, ModeTypeFlags},
+        drm::control::{
+            connector, crtc, Device as DrmControlDevice, ModeTypeFlags,
+            PageFlipFlags,
+        },
+        // `.size()`/`.pitch()` on the raw `drm::control::dumbbuffer::
+        // DumbBuffer` (used in `create_dumb_swapchain`/
+        // `render_udev_pixman`) are trait methods on `drm::buffer::
+        // Buffer`, not inherent methods — a real compiler error (not a
+        // guess) confirmed this: "private field, not a method... trait
+        // `Buffer` which provides `size` is implemented but not in
+        // scope". `drm::buffer::Buffer` is reexported through smithay
+        // the same way `drm::control::*` already is, so this is the
+        // same reexport path, not a new direct `drm` dependency (see
+        // Cargo.toml's own note on why a *direct* `drm` dependency
+        // caused real version-conflict bugs earlier).
+        drm::buffer::Buffer as DrmBufferTrait,
     },
     utils::{DeviceFd, Point, Size, Transform},
 };
 use std::{collections::HashMap, os::unix::io::OwnedFd, time::Duration};
 use tracing::{error, info, warn};
 
-use crate::state::{BackendData, BlueState, GpuDevice, OutputRenderSurface, UdevData, WinitData};
+use crate::state::{
+    BackendData, BlueState, DumbSwapchain, DumbSwapchainBuffer, GpuDevice, OutputRenderSurface,
+    RenderBackend, SurfaceBackend, UdevData, WinitData,
+};
 
 /// Multi-GPU render-node import (hybrid-graphics laptops) — see module
 /// doc for what's implemented (GpuManager lifecycle + the cross-copy
@@ -357,9 +377,11 @@ pub fn init_udev(
 
 /// Registers a GPU's `DrmDeviceNotifier` on the event loop so
 /// `DrmEvent::VBlank` (a previous pageflip completed) and
-/// `DrmEvent::Error` reach `GbmBufferedSurface::frame_submitted()`. This
-/// is required for the GBM swapchain to keep cycling buffers past the
-/// first frame — see the comment on `open_gpu`'s return type.
+/// `DrmEvent::Error` reach either `GbmBufferedSurface::frame_submitted()`
+/// (GLES path) or the dumb-swapchain's own front/back swap bookkeeping
+/// (Pixman path — see `SurfaceBackend::Dumb`). Required for either
+/// swapchain to keep cycling buffers past the first frame — see the
+/// comment on `open_gpu`'s return type.
 fn register_drm_notifier(
     loop_handle: &LoopHandle<'static, BlueState>,
     node: DrmNode,
@@ -371,8 +393,27 @@ fn register_drm_notifier(
                 if let BackendData::Udev(ref mut udev) = state.backend_data {
                     if let Some(gpu) = udev.devices.get_mut(&node) {
                         if let Some(surface) = gpu.surfaces.get_mut(&crtc) {
-                            if let Err(e) = surface.gbm_surface.frame_submitted() {
-                                warn!("frame_submitted failed for {:?}: {}", crtc, e);
+                            match &mut surface.surface {
+                                SurfaceBackend::Gbm(gbm_surface) => {
+                                    if let Err(e) = gbm_surface.frame_submitted() {
+                                        warn!("frame_submitted failed for {:?}: {}", crtc, e);
+                                    }
+                                }
+                                // The dumb-buffer swapchain has no
+                                // equivalent "tell it the flip
+                                // completed" call to make — its
+                                // front/back index is advanced
+                                // synchronously in `render_udev_pixman`
+                                // right after a successful `page_flip`
+                                // ioctl, not asynchronously here on
+                                // `VBlank`. This arm still exists (rather
+                                // than matching just `Gbm` and ignoring
+                                // `Dumb`) so a future person adding
+                                // per-flip bookkeeping to the Pixman path
+                                // has an obvious place to put it, and so
+                                // this `match` stays exhaustive as
+                                // `SurfaceBackend` grows.
+                                SurfaceBackend::Dumb(_) => {}
                             }
                         }
                     }
@@ -450,12 +491,16 @@ fn scan_drm_outputs(
 ) {
     let Ok(resources) = drm.resource_handles() else { return };
 
-    // Lazily create the shared EGL/GLES renderer for this GPU.
+    // Lazily create the shared renderer for this GPU — GLES if a usable
+    // EGL driver stack exists, Pixman (software) otherwise. See
+    // `create_renderer_for_gpu`'s doc for exactly which real-world case
+    // the fallback is for.
+    let mut is_software = false;
     let renderer_ready = if let BackendData::Udev(ref mut udev) = state.backend_data {
         if let Some(gpu) = udev.devices.get_mut(&node) {
             if gpu.renderer.is_none() {
-                match create_gles_renderer(&gpu.gbm) {
-                    Ok(mut r) => {
+                match create_renderer_for_gpu(&gpu.gbm, node) {
+                    Ok(RenderBackend::Gles(mut r)) => {
                         gpu.hdr_tonemap_shader = match hdr_shader::compile_hdr_tonemap_shader(&mut r) {
                             Ok(program) => Some(program),
                             Err(e) => {
@@ -463,12 +508,24 @@ fn scan_drm_outputs(
                                 None
                             }
                         };
-                        gpu.renderer = Some(r);
+                        gpu.renderer = Some(RenderBackend::Gles(r));
                         true
                     }
-                    Err(e) => { error!("Failed to create EGL/GLES renderer for {:?}: {}", node, e); false }
+                    Ok(RenderBackend::Pixman(r)) => {
+                        // No HDR tone-mapping on the software path —
+                        // `hdr_shader.rs`'s wrapper is GLES-specific
+                        // (see this file's module doc); Pixman-rendered
+                        // outputs simply don't tone-map HDR content,
+                        // same as before this fallback existed (they
+                        // rendered nothing at all).
+                        is_software = true;
+                        gpu.renderer = Some(RenderBackend::Pixman(r));
+                        true
+                    }
+                    Err(e) => { error!("Failed to create any renderer (GLES or Pixman) for {:?}: {}", node, e); false }
                 }
             } else {
+                is_software = gpu.renderer.as_ref().map(RenderBackend::is_software).unwrap_or(false);
                 true
             }
         } else {
@@ -479,7 +536,14 @@ fn scan_drm_outputs(
     };
     if !renderer_ready {
         warn!("No renderer available for GPU {:?}, outputs on it will not render", node);
-    } else if state.dmabuf_state.is_none() {
+    } else if state.dmabuf_state.is_none() && !is_software {
+        // dmabuf/color-management are both GLES/EGL-specific client
+        // protocols (dmabuf import needs an EGL context to bind
+        // against; see `protocols/dmabuf.rs`) — skip advertising them
+        // for a software-only GPU rather than registering globals that
+        // would immediately fail every import a client attempted
+        // through them. A client on a Pixman-backed output still gets
+        // normal shm-buffer rendering, just not zero-copy dmabuf.
         // First GPU with a working renderer: register the client-facing
         // dmabuf + color-management globals (see protocols/dmabuf.rs,
         // protocols/color_management.rs). Only done once — multi-GPU
@@ -497,6 +561,13 @@ fn scan_drm_outputs(
         let init_result = if let BackendData::Udev(ref udev) = state.backend_data {
             udev.devices.get(&node)
                 .and_then(|gpu| gpu.renderer.as_ref())
+                // `dmabuf::init_dmabuf` takes a `&GlesRenderer` — only
+                // reachable when this GPU actually landed on the GLES
+                // arm, which the `!is_software` check above already
+                // guarantees for every path that reaches here, but
+                // `and_then` on `as_gles()` keeps this block correct
+                // even if that guard is ever loosened later.
+                .and_then(RenderBackend::as_gles)
                 .map(|renderer| crate::protocols::dmabuf::init_dmabuf(&display_handle, renderer, dev_id))
         } else {
             None
@@ -609,60 +680,97 @@ fn scan_drm_outputs(
         output.set_preferred(sm);
         state.space.map_output(&output, Point::from((x_off, 0)));
 
-        // Build the DRM surface + GBM swapchain for this CRTC/connector.
+        // Build the swapchain for this CRTC/connector — a GBM/EGL one on
+        // the normal GLES path, or a plain double-buffered dumb-buffer
+        // one on the Pixman (software) fallback path. Which arm runs is
+        // decided once per GPU (whatever `create_renderer_for_gpu` chose
+        // above), not per-output, since it follows from what renderer
+        // context this GPU has, not from anything connector-specific.
         if let BackendData::Udev(ref mut udev) = state.backend_data {
             if let Some(gpu) = udev.devices.get_mut(&node) {
-                match drm.create_surface(crtc, mode, &[*conn_handle]) {
-                    Ok(drm_surface) => {
-                        let allocator = GbmAllocator::new(gpu.gbm.clone(), GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
-                        // `GbmDevice` has no `supported_formats()` method
-                        // (that was a guess that didn't hold up against
-                        // the real API) — and `GbmBufferedSurface::new`
-                        // at this pinned rev takes a plain `&[DrmFourcc]`
-                        // (pixel formats only, no modifiers), not a
-                        // `FormatSet` of (format, modifier) pairs as in
-                        // newer smithay. Real modifier negotiation
-                        // (vendor tiled/compressed formats) isn't
-                        // reachable through this API at this rev — still
-                        // a real follow-up, see ROADMAP.md.
-                        //
-                        // What *is* achievable here without risking an
-                        // unverifiable API assumption (no compiler in
-                        // this environment to check e.g. whether
-                        // `DrmSurface`/`GbmAllocator` implement `Clone`
-                        // for a retry-on-failure loop): pass a richer,
-                        // priority-ordered format list to the *same*
-                        // single call this already used — it already took
-                        // a multi-element slice ([Xrgb8888, Argb8888]),
-                        // so extending that list is a safe, consistent
-                        // use of the existing calling convention, not a
-                        // new API assumption. 10-bit XRGB2101010/
-                        // ARGB2101010 first (meaningfully reduces
-                        // banding on HDR-capable panels that can scan it
-                        // out), falling back within the same call to the
-                        // universally-supported 8-bit formats.
-                        let formats: &[smithay::backend::allocator::Fourcc] = &[
-                            smithay::backend::allocator::Fourcc::Xrgb2101010,
-                            smithay::backend::allocator::Fourcc::Argb2101010,
-                            smithay::backend::allocator::Fourcc::Xrgb8888,
-                            smithay::backend::allocator::Fourcc::Argb8888,
-                        ];
-                        match GbmBufferedSurface::new(drm_surface, allocator, formats, None) {
-                            Ok(gbm_surface) => {
-                                let damage_tracker = OutputDamageTracker::from_output(&output);
-                                gpu.surfaces.insert(crtc, OutputRenderSurface {
-                                    output: output.clone(),
-                                    gbm_surface,
-                                    damage_tracker,
-                                    connector: *conn_handle,
-                                });
-                                used_crtcs.push(crtc);
-                                info!("Lit up output {} on CRTC {:?} ({}x{}@{})", name, crtc, w, h, mode.vrefresh());
-                            }
-                            Err(e) => error!("GbmBufferedSurface::new failed for {}: {}", name, e),
+                let is_software = gpu.renderer.as_ref().map(RenderBackend::is_software).unwrap_or(false);
+                if is_software {
+                    match create_dumb_swapchain(drm, crtc, *conn_handle, mode, w as u32, h as u32) {
+                        Ok(dumb) => {
+                            let damage_tracker = OutputDamageTracker::from_output(&output);
+                            gpu.surfaces.insert(crtc, OutputRenderSurface {
+                                output: output.clone(),
+                                surface: SurfaceBackend::Dumb(dumb),
+                                damage_tracker,
+                                connector: *conn_handle,
+                            });
+                            used_crtcs.push(crtc);
+                            info!("Lit up output {} on CRTC {:?} ({}x{}@{}) [software/Pixman]", name, crtc, w, h, mode.vrefresh());
                         }
+                        Err(e) => error!("create_dumb_swapchain failed for {}: {}", name, e),
                     }
-                    Err(e) => error!("drm.create_surface failed for {}: {}", name, e),
+                } else {
+                    match drm.create_surface(crtc, mode, &[*conn_handle]) {
+                        Ok(drm_surface) => {
+                            let allocator = GbmAllocator::new(gpu.gbm.clone(), GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+                            // `GbmDevice` has no `supported_formats()` method
+                            // (that was a guess that didn't hold up against
+                            // the real API).
+                            //
+                            // **Modifier negotiation — was actually wrong,
+                            // not just absent.** `GbmBufferedSurface::new`'s
+                            // real signature (checked directly against
+                            // smithay's own source at
+                            // `backend/drm/surface/gbm.rs`, not assumed
+                            // this time) is `fn new(drm, allocator,
+                            // color_formats: &[Fourcc], renderer_formats:
+                            // impl IntoIterator<Item = Format>)` — a real
+                            // *fourth* parameter carrying (format,
+                            // modifier) pairs, which the previous version
+                            // of this code passed `None` for. `Option<T>`
+                            // does implement `IntoIterator<Item = T>` (so
+                            // that compiled, or would have), but `None`
+                            // means an *empty* iterator — this was
+                            // silently telling GBM "the renderer supports
+                            // zero formats with any modifier", not merely
+                            // "no preference"/"figure it out yourself".
+                            // Fixed below by passing the renderer's own
+                            // `dmabuf_formats()` — the exact same
+                            // `Vec<Format>` (format+modifier pairs)
+                            // `protocols/dmabuf.rs` already queries from
+                            // this renderer for the dmabuf-feedback
+                            // protocol, so this isn't a new/unverified API
+                            // call, just reusing one already proven to
+                            // compile-shape-correctly elsewhere in this
+                            // codebase. `GbmBufferedSurface::new` then does
+                            // the actual negotiation internally (real
+                            // tiled/compressed vendor modifiers now
+                            // reachable when the renderer and the DRM
+                            // plane both advertise support for the same
+                            // one), not this code manually parsing a
+                            // plane's `IN_FORMATS` blob by hand.
+                            let formats: &[smithay::backend::allocator::Fourcc] = &[
+                                smithay::backend::allocator::Fourcc::Xrgb2101010,
+                                smithay::backend::allocator::Fourcc::Argb2101010,
+                                smithay::backend::allocator::Fourcc::Xrgb8888,
+                                smithay::backend::allocator::Fourcc::Argb8888,
+                            ];
+                            let renderer_formats: Vec<smithay::backend::allocator::Format> = gpu.renderer.as_ref()
+                                .and_then(RenderBackend::as_gles)
+                                .map(|r| r.dmabuf_formats().into_iter().collect())
+                                .unwrap_or_default();
+                            match GbmBufferedSurface::new(drm_surface, allocator, formats, renderer_formats) {
+                                Ok(gbm_surface) => {
+                                    let damage_tracker = OutputDamageTracker::from_output(&output);
+                                    gpu.surfaces.insert(crtc, OutputRenderSurface {
+                                        output: output.clone(),
+                                        surface: SurfaceBackend::Gbm(gbm_surface),
+                                        damage_tracker,
+                                        connector: *conn_handle,
+                                    });
+                                    used_crtcs.push(crtc);
+                                    info!("Lit up output {} on CRTC {:?} ({}x{}@{})", name, crtc, w, h, mode.vrefresh());
+                                }
+                                Err(e) => error!("GbmBufferedSurface::new failed for {}: {}", name, e),
+                            }
+                        }
+                        Err(e) => error!("drm.create_surface failed for {}: {}", name, e),
+                    }
                 }
             }
         }
@@ -717,6 +825,28 @@ pub fn apply_hardware_modeset(state: &mut BlueState, output_name: &str, width: i
             return false;
         };
 
+        // Same GLES-vs-Pixman branch as `scan_drm_outputs` — a hardware
+        // modeset has to rebuild whichever kind of swapchain this
+        // output already had (a software-fallback GPU doesn't suddenly
+        // gain a GBM/EGL path just because Settings requested a
+        // different resolution), so this reads the *existing* surface's
+        // kind rather than re-deciding from scratch.
+        let was_software = matches!(gpu.surfaces.get(&crtc).map(|s| &s.surface), Some(SurfaceBackend::Dumb(_)));
+
+        if was_software {
+            match create_dumb_swapchain(&mut gpu.drm, crtc, connector, drm_mode, width as u32, height as u32) {
+                Ok(dumb) => {
+                    if let Some(existing) = gpu.surfaces.get_mut(&crtc) {
+                        existing.surface = SurfaceBackend::Dumb(dumb);
+                        existing.damage_tracker = OutputDamageTracker::from_output(&existing.output);
+                    }
+                    info!("Hardware modeset applied: {} -> {}x{}@{} [software/Pixman]", output_name, width, height, refresh_mhz);
+                    return true;
+                }
+                Err(e) => { error!("apply_hardware_modeset: create_dumb_swapchain failed for {}: {}", output_name, e); return false; }
+            }
+        }
+
         let drm_surface = match gpu.drm.create_surface(crtc, drm_mode, &[connector]) {
             Ok(s) => s,
             Err(e) => { error!("apply_hardware_modeset: drm.create_surface failed for {}: {}", output_name, e); return false; }
@@ -726,14 +856,22 @@ pub fn apply_hardware_modeset(state: &mut BlueState, output_name: &str, width: i
         // Same priority-ordered format list as scan_drm_outputs (10-bit
         // first, 8-bit fallback within the same call) — see that
         // function's comment for why this shape rather than a retry
-        // loop.
+        // loop. Same `renderer.dmabuf_formats()` fix for the
+        // renderer_formats/modifier-negotiation argument too — see that
+        // function's comment for the full story on why `None` there was
+        // an actual bug (empty formats, not "no preference"), not just a
+        // missing-feature placeholder.
         let formats: &[smithay::backend::allocator::Fourcc] = &[
             smithay::backend::allocator::Fourcc::Xrgb2101010,
             smithay::backend::allocator::Fourcc::Argb2101010,
             smithay::backend::allocator::Fourcc::Xrgb8888,
             smithay::backend::allocator::Fourcc::Argb8888,
         ];
-        let gbm_surface = match GbmBufferedSurface::new(drm_surface, allocator, formats, None) {
+        let renderer_formats: Vec<smithay::backend::allocator::Format> = gpu.renderer.as_ref()
+            .and_then(RenderBackend::as_gles)
+            .map(|r| r.dmabuf_formats().into_iter().collect())
+            .unwrap_or_default();
+        let gbm_surface = match GbmBufferedSurface::new(drm_surface, allocator, formats, renderer_formats) {
             Ok(s) => s,
             Err(e) => { error!("apply_hardware_modeset: GbmBufferedSurface::new failed for {}: {}", output_name, e); return false; }
         };
@@ -742,7 +880,7 @@ pub fn apply_hardware_modeset(state: &mut BlueState, output_name: &str, width: i
         // (and the `DrmSurface` it owned) tears down its DRM resources;
         // the fresh one above already has the new mode committed.
         if let Some(existing) = gpu.surfaces.get_mut(&crtc) {
-            existing.gbm_surface = gbm_surface;
+            existing.surface = SurfaceBackend::Gbm(gbm_surface);
             existing.damage_tracker = OutputDamageTracker::from_output(&existing.output);
         }
         info!("Hardware modeset applied: {} -> {}x{}@{}", output_name, width, height, refresh_mhz);
@@ -770,6 +908,138 @@ fn create_gles_renderer(
     let egl_context = EGLContext::new(&egl_display)?;
     let renderer = unsafe { GlesRenderer::new(egl_context)? };
     Ok(renderer)
+}
+
+/// Picks a `RenderBackend` for this GPU node: GLES/EGL if it's available
+/// (the normal, hardware-accelerated case), falling back to the
+/// CPU-only `PixmanRenderer` if it isn't — see `state::RenderBackend`'s
+/// doc for exactly which real-world case that's for (a KMS-capable
+/// device with no working GPU driver, e.g. a headless VM/CI runner using
+/// `vkms` or a software `virtio-gpu`).
+///
+/// `PixmanRenderer::new()` has no GBM/EGL dependency at all — it's a
+/// pure in-memory software rasterizer (confirmed directly against
+/// `smithay`'s `backend::renderer::pixman` module at the pinned rev:
+/// its constructor takes no device/display argument), so unlike the
+/// GLES arm there's nothing here that can fail for GPU-driver reasons;
+/// its `Result` is kept for symmetry with `create_gles_renderer` and to
+/// surface a genuine allocation failure rather than unwrap it away.
+fn create_renderer_for_gpu(gbm: &GbmDevice<DrmDeviceFd>, node: DrmNode) -> Result<RenderBackend, Box<dyn std::error::Error>> {
+    match create_gles_renderer(gbm) {
+        Ok(r) => Ok(RenderBackend::Gles(r)),
+        Err(e) => {
+            warn!(
+                "GPU {:?}: EGL/GLES renderer unavailable ({}), falling back to the \
+                 software Pixman renderer — this output will still render, just \
+                 without GPU acceleration (expect noticeably higher CPU usage and \
+                 lower framerates, especially at high resolutions)",
+                node, e
+            );
+            let renderer = PixmanRenderer::new()?;
+            Ok(RenderBackend::Pixman(renderer))
+        }
+    }
+}
+
+/// Allocates the Pixman path's swapchain for one CRTC: two dumb buffers
+/// (plain KMS-mappable system memory, no GBM/EGL involved at all — see
+/// `state::DumbSwapchain`'s doc), each wrapped in its own framebuffer id,
+/// with the first one committed as the CRTC's initial scanout buffer via
+/// `set_crtc` (mirroring what `GbmBufferedSurface::new`'s own first
+/// modeset does internally on the GLES path — a freshly created surface
+/// needs *something* on screen before the first `page_flip`, which
+/// (unlike `set_crtc`) cannot itself perform the initial modeset).
+///
+/// Written without a compiler available to verify the exact `drm`-crate
+/// method signatures at this pinned smithay rev's dependency version —
+/// same caveat, and same reasoning for why this is still worth adding
+/// rather than leaving Pixman-backed GPUs entirely dark, as
+/// `scan_drm_outputs`'s own doc comment already states for the GBM path.
+fn create_dumb_swapchain(
+    drm: &mut DrmDevice,
+    crtc: crtc::Handle,
+    connector: connector::Handle,
+    mode: smithay::reexports::drm::control::Mode,
+    width: u32,
+    height: u32,
+) -> Result<DumbSwapchain, Box<dyn std::error::Error>> {
+    // Second reversal on this function, both from real `cargo build`
+    // output rather than guessing — worth recording exactly what
+    // happened so the next person (or the next compile pass) doesn't
+    // repeat either mistake:
+    //
+    // 1. First version: raw `drm.create_dumb_buffer(...)` (the
+    //    `drm`-crate `control::Device` trait method). Wrong docstring
+    //    claim at the time ("this returns smithay's own
+    //    allocator::dumb::DumbBuffer") — it doesn't; it returns
+    //    `drm::control::dumbbuffer::DumbBuffer`, a same-named but
+    //    distinct type, confirmed by the compiler's own "DumbBuffer and
+    //    DumbBuffer have similar names, but are actually distinct
+    //    types" error.
+    // 2. Second version: switched to smithay's own
+    //    `backend::allocator::dumb::DumbAllocator`/`DumbBuffer` on the
+    //    theory that *that* was the type `PixmanRenderer::bind` needed.
+    //    Also wrong, and the real compiler output settles both
+    //    questions at once: (a) smithay's `allocator::dumb::DumbBuffer`
+    //    does NOT implement `drm::buffer::Buffer` at all (so
+    //    `add_framebuffer` rejects it — only `GbmBuffer`,
+    //    `gbm::BufferObject<T>`, and the RAW
+    //    `drm::control::dumbbuffer::DumbBuffer` implement that trait,
+    //    per the compiler's own "the following other types implement
+    //    trait" list), and (b) `PixmanRenderer` doesn't implement
+    //    `Bind<DumbBuffer>` for *either* DumbBuffer type anyway — its
+    //    only two `Bind` impls are `Bind<Dmabuf>` and
+    //    `Bind<pixman::Image<'static, 'static>>` (also straight from
+    //    the compiler's own error).
+    //
+    // Correct shape, now: raw `drm.create_dumb_buffer(...)` for
+    // KMS/framebuffer purposes (`add_framebuffer`/`set_crtc`/
+    // `page_flip` all want *this* type) — reverting to what version 1
+    // used, which really was right for this half of the problem — and
+    // separately, at render time, map that raw dumb buffer's memory and
+    // wrap the mapping in a `pixman::Image` (see `render_udev_pixman`)
+    // for the `PixmanRenderer::bind` half, which neither earlier version
+    // did at all. Two different buffer-shaped needs (KMS scanout object,
+    // CPU-mappable render target), two different types bridging into
+    // them from the one underlying dumb-buffer allocation — not one
+    // type serving both, which is what both earlier attempts assumed.
+    let make_buffer = |drm: &mut DrmDevice| -> Result<DumbSwapchainBuffer, Box<dyn std::error::Error>> {
+        // XRGB8888 rather than the 10-bit formats `scan_drm_outputs`
+        // prioritizes for the GBM path — dumb buffers are the
+        // universally-supported baseline path precisely because every
+        // KMS driver has to accept plain linear 8bpc XRGB8888 for them.
+        let dumb = drm
+            .create_dumb_buffer((width as u32, height as u32), Fourcc::Xrgb8888, 32)
+            .map_err(|e| format!("create_dumb_buffer: {e}"))?;
+        let fb = drm
+            .add_framebuffer(&dumb, 24, 32)
+            .map_err(|e| format!("add_framebuffer (dumb): {e}"))?;
+        Ok(DumbSwapchainBuffer { dumb, fb, ever_rendered: false })
+    };
+
+    let buf0 = make_buffer(drm)?;
+    let buf1 = make_buffer(drm)?;
+
+    // Initial modeset — commits `buf0` as the CRTC's scanout buffer
+    // *and* programs the display timing in one call, exactly like the
+    // very first frame of a `GbmBufferedSurface`-backed output needs to
+    // happen somewhere too (there it happens implicitly inside
+    // `GbmBufferedSurface::new`; here it's explicit since we're not
+    // going through that type at all). Legacy `set_crtc` (not an atomic
+    // commit) — the deliberately simpler, more universally-supported
+    // KMS entry point; atomic-only Pixman-fallback devices are rare
+    // enough (and legacy `set_crtc` broad enough) that this isn't worth
+    // the extra complexity of an atomic property-blob commit for the
+    // one-time initial modeset.
+    drm.set_crtc(crtc, Some(buf0.fb), (0, 0), &[connector], Some(mode))
+        .map_err(|e| format!("set_crtc (dumb initial modeset): {e}"))?;
+
+    Ok(DumbSwapchain {
+        crtc,
+        connector,
+        buffers: [buf0, buf1],
+        front: 0,
+    })
 }
 
 /// Actually renders and presents a frame for one DRM-backed output.
@@ -819,7 +1089,40 @@ where
     out
 }
 
+/// Dispatches to the GLES or Pixman render path depending on which kind
+/// of swapchain this output ended up with (decided once, per-GPU, back
+/// in `scan_drm_outputs` — see `create_renderer_for_gpu`'s doc). Kept as
+/// a thin `match` rather than folding the branch into one function
+/// because the two paths' element types genuinely differ
+/// (`WaylandSurfaceRenderElement<GlesRenderer>` vs
+/// `WaylandSurfaceRenderElement<PixmanRenderer>` are unrelated concrete
+/// types — smithay's renderer element types are generic over the
+/// renderer, not trait objects — so there's no single code path that
+/// typechecks for both without a lot of unnecessary generic plumbing
+/// through a function that, unlike `render_winit`, only ever needs to
+/// run for one output at a time anyway).
 pub fn render_udev(state: &mut BlueState, node: DrmNode, crtc: crtc::Handle) {
+    let is_software = if let BackendData::Udev(ref udev) = state.backend_data {
+        udev.devices.get(&node)
+            .and_then(|g| g.surfaces.get(&crtc))
+            .map(|s| matches!(s.surface, SurfaceBackend::Dumb(_)))
+            .unwrap_or(false)
+    } else {
+        return;
+    };
+    if is_software {
+        render_udev_pixman(state, node, crtc);
+    } else {
+        render_udev_gles(state, node, crtc);
+    }
+}
+
+/// The original GLES/GBM render path — HDR tone-mapping, screencopy,
+/// atomic pageflip via `GbmBufferedSurface`. Unchanged in behavior from
+/// before the Pixman fallback existed; only renamed (was `render_udev`)
+/// and given a `SurfaceBackend::Gbm(..)` match instead of assuming every
+/// surface is GBM-backed.
+fn render_udev_gles(state: &mut BlueState, node: DrmNode, crtc: crtc::Handle) {
     // Snapshot the output + this GPU's compiled HDR program before
     // taking `state.backend_data`'s mutable borrow below — both are
     // cheap to clone (smithay's `Output` and `GlesTexProgram` wrap an
@@ -845,8 +1148,9 @@ pub fn render_udev(state: &mut BlueState, node: DrmNode, crtc: crtc::Handle) {
 
     let BackendData::Udev(ref mut udev) = state.backend_data else { return };
     let Some(gpu) = udev.devices.get_mut(&node) else { return };
-    let Some(renderer) = gpu.renderer.as_mut() else { return };
+    let Some(renderer) = gpu.renderer.as_mut().and_then(RenderBackend::as_gles_mut) else { return };
     let Some(surface) = gpu.surfaces.get_mut(&crtc) else { return };
+    let SurfaceBackend::Gbm(ref mut gbm_surface) = surface.surface else { return };
 
     let output_scale = surface.output.current_scale().fractional_scale() as f32;
 
@@ -876,7 +1180,7 @@ pub fn render_udev(state: &mut BlueState, node: DrmNode, crtc: crtc::Handle) {
 
     let mode_size = surface.output.current_mode().map(|m| m.size).unwrap_or(Size::from((0, 0)));
 
-    let (mut dmabuf, age) = match surface.gbm_surface.next_buffer() {
+    let (mut dmabuf, age) = match gbm_surface.next_buffer() {
         Ok(v) => v,
         Err(e) => { warn!("next_buffer failed for {:?}: {}", crtc, e); return; }
     };
@@ -927,8 +1231,174 @@ pub fn render_udev(state: &mut BlueState, node: DrmNode, crtc: crtc::Handle) {
     // assumed) — `queue_buffer` wants it owned, so `.cloned()` converts
     // `Option<&Vec<_>>` to `Option<Vec<_>>`, exactly as the compiler's
     // own suggestion for this error.
-    if let Err(e) = surface.gbm_surface.queue_buffer(None, render_result.damage.cloned(), ()) {
+    if let Err(e) = gbm_surface.queue_buffer(None, render_result.damage.cloned(), ()) {
         warn!("queue_buffer (pageflip) failed for {:?}: {}", crtc, e);
+    }
+}
+
+/// The Pixman/software render path — no HDR tone-mapping (GLES-only, see
+/// module doc), screencopy now serviced too (via
+/// `screencopy::service_screencopy_pixman`, see that function's own doc
+/// for why it's a separate function rather than a generic one shared
+/// with the GLES path), no multi-GPU cross-import (a software-fallback
+/// GPU is definitionally the *only* renderer for whatever it's driving —
+/// there's no second GPU to import from in that scenario). What it does
+/// give a GPU-less output: an actual visible desktop, where before this
+/// existed the output was detected but permanently blank (see
+/// `create_renderer_for_gpu`'s doc for the motivating case).
+///
+/// Same "written without a compiler in this environment" caveat as
+/// `scan_drm_outputs`/`create_dumb_swapchain` — the exact shape of
+/// `PixmanRenderer::bind`'s accepted target type in particular is the
+/// riskiest guess in this function (smithay's Pixman renderer binds
+/// against something implementing its internal buffer-access traits;
+/// mapped `DumbBuffer` memory is architecturally the right shape for
+/// that — plain CPU-addressable pixels, which is exactly what Pixman
+/// needs and exactly why the dumb-buffer swapchain was built around
+/// `DumbBuffer` rather than e.g. GBM linear buffers — but the precise
+/// method/type names at this pinned rev aren't verified against a
+/// compiler). Treat as a scaffold to compile-fix, same as the rest of
+/// this file's udev path was when it was first written.
+fn render_udev_pixman(state: &mut BlueState, node: DrmNode, crtc: crtc::Handle) {
+    let BackendData::Udev(ref mut udev) = state.backend_data else { return };
+    let Some(gpu) = udev.devices.get_mut(&node) else { return };
+    let Some(renderer) = gpu.renderer.as_mut().and_then(RenderBackend::as_pixman_mut) else { return };
+    let Some(surface) = gpu.surfaces.get_mut(&crtc) else { return };
+    let SurfaceBackend::Dumb(ref mut swapchain) = surface.surface else { return };
+
+    let output_scale = surface.output.current_scale().fractional_scale() as f32;
+
+    use smithay::desktop::space::SpaceRenderElements;
+    let mut elements: Vec<SpaceRenderElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>> =
+        state.space.render_elements_for_output(renderer, &surface.output, output_scale)
+            .unwrap_or_default();
+    elements.extend(crate::protocols::input_method::render_elements(
+        &state.input_method_popups, renderer, output_scale as f64,
+    ));
+    elements.extend(layer_shell_elements(&surface.output, renderer, output_scale as f64));
+
+    // Render into the back buffer (index `1 - front`). `PixmanRenderer`
+    // only implements `Bind<Dmabuf>` and `Bind<pixman::Image<'static,
+    // 'static>>` (confirmed by a real compiler error — an earlier
+    // version of this function tried `renderer.bind(&mut back.dumb)`
+    // directly, which doesn't typecheck against either impl) — a plain
+    // KMS dumb buffer isn't either of those on its own, so it has to be
+    // mapped into CPU-addressable memory first and wrapped in a
+    // `pixman::Image` view over that mapping, which *is* bindable.
+    //
+    // `map_dumb_buffer` — real `drm`-crate `control::Device` trait
+    // method (mirrors `add_framebuffer`/`create_dumb_buffer`, all three
+    // are part of the same dumb-buffer ioctl family) — returns a
+    // `DumbMapping` guard whose `Deref<Target = [u8]>` is the mapped
+    // memory; kept alive in `_mapping` for this whole scope, since
+    // `image` (built via the `unsafe` `from_raw_mut`, which lets the
+    // lifetime be claimed as `'static` even though the real backing
+    // memory is only valid as long as `_mapping` is) has no compiler-
+    // enforced tie to it — dropping `_mapping` before `image`/`target`
+    // are done being used would be a real use-after-unmap bug, so it's
+    // named `_mapping` (not `_`) specifically as a reminder not to
+    // reorder these two lines relative to the rendering below.
+    let age = swapchain.back_age();
+    let back = swapchain.back_mut();
+    let (buf_w, buf_h) = back.dumb.size();
+    let stride = back.dumb.pitch() as usize;
+    let mut _mapping = match gpu.drm.map_dumb_buffer(&mut back.dumb) {
+        Ok(m) => m,
+        Err(e) => { warn!("map_dumb_buffer failed for {:?}: {}", crtc, e); return; }
+    };
+    // XRGB8888, matching `create_dumb_swapchain`'s allocation format —
+    // `TryFrom<Fourcc>` rather than naming a `pixman::FormatCode`
+    // variant directly (pixman's own C-derived format naming
+    // convention doesn't line up 1:1 with `Fourcc`'s, and the crate
+    // ships this exact conversion — evidenced by its own
+    // `UnsupportedDrmFourcc`/`UnsupportedFormatCode` error types —
+    // specifically so callers don't have to hand-map between the two
+    // naming schemes).
+    let Ok(pixman_format) = smithay::reexports::pixman::FormatCode::try_from(Fourcc::Xrgb8888) else {
+        warn!("pixman FormatCode has no Xrgb8888 equivalent — should not happen, this format is one of pixman's most basic ones");
+        return;
+    };
+    let image = unsafe {
+        smithay::reexports::pixman::Image::from_raw_mut(
+            pixman_format,
+            buf_w as usize,
+            buf_h as usize,
+            _mapping.as_mut_ptr() as *mut u32,
+            stride,
+            false,
+        )
+    };
+    let mut image = match image {
+        Ok(img) => img,
+        Err(e) => { warn!("pixman::Image::from_raw_mut failed for {:?}: {:?}", crtc, e); return; }
+    };
+    let mut target = match renderer.bind(&mut image) {
+        Ok(t) => t,
+        Err(e) => { warn!("pixman renderer.bind failed for {:?}: {}", crtc, e); return; }
+    };
+
+    let render_result = match surface.damage_tracker.render_output(
+        renderer, &mut target, age, &elements, [0.08_f32, 0.10, 0.15, 1.0],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("render_output (pixman) failed for {:?}: {:?}", crtc, e);
+            drop(target);
+            drop(image);
+            drop(_mapping);
+            return;
+        }
+    };
+
+    // Service pending screencopy requests (grim et al.) — same
+    // must-happen-while-bound requirement as the GLES path (see that
+    // function's own comment on this same call), just against the
+    // Pixman target/renderer instead. Real per-frame damage now passed
+    // through (not `None`) so `copy_with_damage` screencopy requests —
+    // the ones a screen recorder actually cares about, see
+    // `service_screencopy`'s own doc on why those specifically wait for
+    // real damage — get serviced on Pixman-backed outputs too, not just
+    // GLES ones.
+    if let Some(mode) = surface.output.current_mode() {
+        let output_name = surface.output.name();
+        crate::protocols::screencopy::service_screencopy_pixman(
+            &mut state.screencopy_state, renderer, &target, &output_name,
+            (mode.size.w, mode.size.h), render_result.damage.map(|v| v.as_slice()),
+        );
+    }
+
+    drop(target);
+    // Drop the pixman `Image` view and the underlying `DumbMapping`
+    // (unmapping it) before touching `gpu.drm`/`back` again below —
+    // `map_dumb_buffer`'s `DumbMapping` guard plausibly borrows from
+    // `gpu.drm` for its unmap-on-drop bookkeeping (real drm-rs mmap
+    // guards commonly do), which would otherwise conflict with the
+    // `gpu.drm.page_flip(...)` call just below. Explicit, not relied on
+    // implicit end-of-scope drop timing, precisely because which of
+    // `back.dumb` vs `gpu.drm` the guard's lifetime is actually tied to
+    // isn't independently confirmed here (see this function's own
+    // top-of-block comment) — dropping early removes the ambiguity
+    // either way.
+    drop(image);
+    drop(_mapping);
+    back.ever_rendered = true;
+
+    // Legacy page-flip ioctl (not an atomic commit — same reasoning as
+    // `create_dumb_swapchain`'s initial `set_crtc`) on the *raw* device,
+    // since this path never went through smithay's `DrmSurface`/
+    // `GbmBufferedSurface` at all. `PageFlipFlags::EVENT` requests the
+    // `DrmEvent::VBlank` this GPU's notifier is already wired to receive
+    // (see `register_drm_notifier`) — consumed there today only for the
+    // GBM path's `frame_submitted()`; the Pixman path doesn't need to
+    // wait for it before advancing `front` below (unlike
+    // `GbmBufferedSurface`, there's no internal swapchain state that
+    // needs the previous flip acknowledged first), just requests the
+    // event for symmetry/future bookkeeping.
+    match gpu.drm.page_flip(crtc, back.fb, PageFlipFlags::EVENT, None) {
+        Ok(()) => {
+            swapchain.front = 1 - swapchain.front;
+        }
+        Err(e) => warn!("page_flip (dumb/pixman) failed for {:?}: {}", crtc, e),
     }
 }
 
