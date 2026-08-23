@@ -258,7 +258,7 @@ fn handle_pointer_motion_abs<B: InputBackend, E: PointerMotionAbsoluteEvent<B>>(
     update_pointer_focus(state, serial, event.time_msec());
 }
 
-fn output_bounds(state: &BlueState) -> (f64, f64, f64, f64) {
+pub(crate) fn output_bounds(state: &BlueState) -> (f64, f64, f64, f64) {
     state
         .space
         .outputs()
@@ -275,7 +275,7 @@ fn output_bounds(state: &BlueState) -> (f64, f64, f64, f64) {
         .unwrap_or((0.0, 0.0, 1920.0, 1080.0))
 }
 
-fn update_pointer_focus(state: &mut BlueState, serial: smithay::utils::Serial, time: u32) {
+pub(crate) fn update_pointer_focus(state: &mut BlueState, serial: smithay::utils::Serial, time: u32) {
     let pointer = state.seat.get_pointer().unwrap();
     let pos = state.pointer_location;
 
