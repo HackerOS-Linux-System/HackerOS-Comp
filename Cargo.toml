@@ -2,7 +2,7 @@
 name = "hackeros-comp"
 version = "0.1.0"
 edition = "2021"
-description = "Blue Environment — Production Wayland Compositor (Smithay)"
+description = "HackerOS Compositor — Production Wayland Compositor (Smithay)"
 
 [[bin]]
 name = "hackeros-comp"
@@ -34,6 +34,18 @@ path = "src/main.rs"
 # `wayland-server` 0.31.14 itself depends on (checked its Cargo.toml)
 # so cargo doesn't have to unify two different semver-compatible ranges.
 [dependencies]
+# D-Bus portal backend (org.freedesktop.impl.portal.RemoteDesktop) — see
+# src/portal/mod.rs's module doc for full scope/caveats. `zbus` is the
+# standard pure-Rust D-Bus library (no libdbus C dependency, matching
+# this project's general preference for pure-Rust deps where reasonable
+# — see e.g. `reis` for EIS, same reasoning). `tokio` feature: zbus 4's
+# async runtime integration needs an explicit executor choice; this
+# project doesn't otherwise use tokio (its event loop is calloop), so
+# zbus's connection is driven from a dedicated OS thread with its own
+# small tokio runtime rather than trying to integrate zbus's async
+# machinery directly into the calloop loop — see that module for how.
+zbus = { version = "4", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "net", "time"] }
 wayland-scanner = "0.31"
 wayland-backend = "0.3"
 # EIS/libei input-emulation server — see src/input_emulation/mod.rs's
