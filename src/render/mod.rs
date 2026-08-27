@@ -111,6 +111,14 @@ pub fn init_winit(
     state.backend_data = BackendData::Winit(Box::new(WinitData { backend, output, damage_tracker, hdr_tonemap_shader }));
     state.seat.add_keyboard(smithay::input::keyboard::XkbConfig::default(), 400, 30).expect("keyboard");
     let _ = state.seat.add_pointer();
+    // Touch capability — was entirely absent (every InputEvent::Touch*
+    // variant fell into handle_input's wildcard `_ => {}` and was
+    // silently dropped). `add_touch()` is smithay's own seat-capability
+    // call, same shape as add_keyboard/add_pointer right above — it's
+    // what makes the wl_seat global actually advertise the `touch`
+    // capability to clients and gives `seat.get_touch()` (used in
+    // input/mod.rs's new touch handlers) something to return.
+    let _ = state.seat.add_touch();
 
     loop_handle.insert_source(events, |event, _, state| {
         match event {
@@ -276,6 +284,7 @@ pub fn init_udev(
 
     state.seat.add_keyboard(smithay::input::keyboard::XkbConfig::default(), 400, 30).expect("kb");
     let _ = state.seat.add_pointer();
+    let _ = state.seat.add_touch();
 
     loop_handle.insert_source(udev_backend, |event, _, state| {
         match event {
