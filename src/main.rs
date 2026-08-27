@@ -1,6 +1,7 @@
 mod state;
 mod input;
 mod input_emulation;
+mod portal;
 mod render;
 mod ipc;
 mod xwayland;
@@ -213,12 +214,21 @@ fn run_udev() {
     st.init_ipc(&loop_handle);
 
     // EIS input-emulation socket — see input_emulation module doc for
-    // scope (real EIS transport, no D-Bus portal service yet). Not
-    // fatal if it fails (e.g. no writable XDG_RUNTIME_DIR in some
-    // exotic sandbox) — the rest of the compositor works fine without
-    // it, this is strictly additive.
-    if let Err(e) = input_emulation::init(&mut st, &loop_handle) {
-        warn!("EIS input-emulation socket failed to start (remote-input clients won't be able to connect): {e}");
+    // scope. Not fatal if it fails (e.g. no writable XDG_RUNTIME_DIR in
+    // some exotic sandbox) — the rest of the compositor works fine
+    // without it, this is strictly additive.
+    match input_emulation::init(&mut st, &loop_handle) {
+        Ok(eis_path) => {
+            // D-Bus portal backend — see portal/mod.rs's module doc for
+            // exactly what this does and its one real, load-bearing
+            // caveat (no consent UI). Only started once the EIS socket
+            // itself actually exists, since ConnectToEIS has nothing to
+            // bridge to otherwise.
+            portal::init(eis_path);
+        }
+        Err(e) => {
+            warn!("EIS input-emulation socket failed to start (remote-input clients won't be able to connect): {e}");
+        }
     }
 
     // Idle / DPMS timer
@@ -317,12 +327,21 @@ fn run_winit() {
     st.init_ipc(&loop_handle);
 
     // EIS input-emulation socket — see input_emulation module doc for
-    // scope (real EIS transport, no D-Bus portal service yet). Not
-    // fatal if it fails (e.g. no writable XDG_RUNTIME_DIR in some
-    // exotic sandbox) — the rest of the compositor works fine without
-    // it, this is strictly additive.
-    if let Err(e) = input_emulation::init(&mut st, &loop_handle) {
-        warn!("EIS input-emulation socket failed to start (remote-input clients won't be able to connect): {e}");
+    // scope. Not fatal if it fails (e.g. no writable XDG_RUNTIME_DIR in
+    // some exotic sandbox) — the rest of the compositor works fine
+    // without it, this is strictly additive.
+    match input_emulation::init(&mut st, &loop_handle) {
+        Ok(eis_path) => {
+            // D-Bus portal backend — see portal/mod.rs's module doc for
+            // exactly what this does and its one real, load-bearing
+            // caveat (no consent UI). Only started once the EIS socket
+            // itself actually exists, since ConnectToEIS has nothing to
+            // bridge to otherwise.
+            portal::init(eis_path);
+        }
+        Err(e) => {
+            warn!("EIS input-emulation socket failed to start (remote-input clients won't be able to connect): {e}");
+        }
     }
 
     // Idle / DPMS timer
