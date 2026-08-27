@@ -4,6 +4,7 @@ use smithay::{
         KeyState, KeyboardKeyEvent,
         PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
         PointerMotionAbsoluteEvent,
+        TouchDownEvent, TouchMotionEvent, TouchUpEvent, TouchCancelEvent, TouchEvent,
     },
     desktop::WindowSurfaceType,
     input::{
@@ -13,6 +14,7 @@ use smithay::{
             GrabStartData as PointerGrabStartData,
             MotionEvent, PointerGrab, PointerInnerHandle, RelativeMotionEvent,
         },
+        touch::{DownEvent as TouchDownData, MotionEvent as TouchMotionData, UpEvent as TouchUpData},
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER},
@@ -32,6 +34,19 @@ pub fn handle_input<B: InputBackend>(state: &mut BlueState, event: InputEvent<B>
         }
         InputEvent::PointerButton { event } => handle_pointer_button(state, &event),
         InputEvent::PointerAxis { event } => handle_pointer_axis(state, &event),
+        // Touch — was entirely absent before (fell into the wildcard
+        // below and was silently dropped, along with the seat never
+        // advertising the `touch` capability at all — see
+        // `render/mod.rs`'s `add_touch()` calls, added alongside this).
+        InputEvent::TouchDown { event } => handle_touch_down(state, &event),
+        InputEvent::TouchMotion { event } => handle_touch_motion(state, &event),
+        InputEvent::TouchUp { event } => handle_touch_up(state, &event),
+        InputEvent::TouchCancel { event } => handle_touch_cancel(state, &event),
+        InputEvent::TouchFrame { .. } => {
+            if let Some(touch) = state.seat.get_touch() {
+                touch.frame(state);
+            }
+        }
         _ => {}
     }
 }
@@ -729,6 +744,120 @@ pub fn start_resize_grab(
         SERIAL_COUNTER.next_serial(),
         smithay::input::pointer::Focus::Clear,
     );
+}
+
+// ── Touch ────────────────────────────────────────────────────────────────
+//
+// New — this seat previously never advertised the `touch` capability at
+// all (see `render/mod.rs`'s `add_touch()` calls, added alongside this),
+// so every `InputEvent::Touch*` variant fell into `handle_input`'s
+// wildcard and was silently dropped, regardless of what hardware sent
+// them (a touchscreen, or the winit backend's own touch emulation when
+// nested inside a host compositor that has one).
+//
+// Written without a compiler available to verify the exact smithay
+// touch API surface at this pinned rev against (same caveat this file's
+// pointer/keyboard code doesn't need anymore having presumably been
+// fixed against real compile errors already, but genuinely applies here
+// since touch is new) — structured to mirror the pointer handlers
+// directly above as closely as the wl_touch protocol's actual semantics
+// allow, which is the one thing I'm confident about regardless of exact
+// method signatures: unlike wl_pointer, focus for a given touch point
+// is resolved *once*, at touch-down, from the touch point's position at
+// that moment — motion/up for that same touch id then keep going to
+// whatever surface was under it at down, even if the finger slides off
+// that surface's bounds entirely (real wl_touch protocol behavior, not
+// specific to this compositor).
+
+/// Resolves which surface (if any) is under a global point — the same
+/// hit-testing `update_pointer_focus` above already does for the
+/// pointer, factored out so touch-down can reuse it without duplicating
+/// the `space.element_under` + `surface_under` dance.
+fn surface_under_point(state: &BlueState, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+    state
+        .space
+        .element_under(pos)
+        .and_then(|(win, win_loc)| {
+            let rel = pos - win_loc.to_f64();
+            win.surface_under(rel, WindowSurfaceType::ALL)
+                .map(|(s, sp)| (s, (win_loc + sp).to_f64()))
+        })
+}
+
+/// Touch is inherently absolute (a touchscreen's coordinate space maps
+/// directly onto the output, same reasoning as
+/// `PointerMotionAbsoluteEvent::position_transformed` above) — this
+/// mirrors `handle_pointer_motion_abs`'s own output-size lookup exactly
+/// rather than introducing a second way to get it.
+fn output_size_for_touch(state: &BlueState) -> Size<i32, Logical> {
+    state
+        .space
+        .outputs()
+        .next()
+        .and_then(|o| state.space.output_geometry(o))
+        .map(|g| g.size)
+        .unwrap_or(Size::from((1920, 1080)))
+}
+
+fn handle_touch_down<B: InputBackend, E: TouchDownEvent<B>>(state: &mut BlueState, event: &E) {
+    let Some(touch) = state.seat.get_touch() else { return };
+    let serial = SERIAL_COUNTER.next_serial();
+    let size = output_size_for_touch(state);
+    let position = event.position_transformed(size);
+    let focus = surface_under_point(state, position);
+
+    touch.down(
+        state,
+        focus,
+        &TouchDownData {
+            slot: event.slot(),
+            location: position,
+            serial,
+            time: event.time_msec(),
+        },
+    );
+}
+
+fn handle_touch_motion<B: InputBackend, E: TouchMotionEvent<B>>(state: &mut BlueState, event: &E) {
+    let Some(touch) = state.seat.get_touch() else { return };
+    let size = output_size_for_touch(state);
+    let position = event.position_transformed(size);
+    // Per wl_touch semantics (see this section's own header note): focus
+    // for this slot was already fixed at touch-down and isn't
+    // re-resolved here — passed as `None` on the theory that smithay's
+    // `TouchHandle::motion` looks up the slot's already-established
+    // focus internally (mirroring how `PointerHandle::motion` is the
+    // one that takes an explicit focus, but touch's per-slot routing is
+    // a different enough model that it may not need it passed again).
+    // Flagged clearly since this is the least-confident guess in this
+    // whole section.
+    touch.motion(
+        state,
+        None,
+        &TouchMotionData {
+            slot: event.slot(),
+            location: position,
+            time: event.time_msec(),
+        },
+    );
+}
+
+fn handle_touch_up<B: InputBackend, E: TouchUpEvent<B>>(state: &mut BlueState, event: &E) {
+    let Some(touch) = state.seat.get_touch() else { return };
+    let serial = SERIAL_COUNTER.next_serial();
+    touch.up(
+        state,
+        &TouchUpData {
+            slot: event.slot(),
+            serial,
+            time: event.time_msec(),
+        },
+    );
+}
+
+fn handle_touch_cancel<B: InputBackend, E: TouchCancelEvent<B>>(state: &mut BlueState, _event: &E) {
+    let Some(touch) = state.seat.get_touch() else { return };
+    touch.cancel(state);
 }
 
 #[cfg(test)]
