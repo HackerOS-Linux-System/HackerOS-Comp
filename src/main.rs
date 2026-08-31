@@ -1,4 +1,6 @@
 mod state;
+mod config;
+mod layout;
 mod input;
 mod input_emulation;
 mod portal;
@@ -116,6 +118,22 @@ fn main() {
     let _log_guard = init_logging();
     info!("HackerOS-Comp v0.2 starting...");
 
+    // `--extern <name>` launches a second, independently-configured HWDE
+    // target reading `config-<name>.hk` instead of `config.hk` and
+    // using its own HackerLand socket name — see `src/config.rs`. The
+    // sde-ipc extern-facing socket this used to also open is disabled
+    // for now (see `src/ipc/mod.rs`'s note). Every other CLI flag this
+    // binary understands is untouched; this is deliberately the only
+    // argument parsed here rather than pulling in a full
+    // argument-parsing crate for one optional flag.
+    let extern_name: Option<String> = {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter().position(|a| a == "--extern").and_then(|i| args.get(i + 1)).cloned()
+    };
+    if let Some(name) = &extern_name {
+        info!("Launching as extern target '{name}'");
+    }
+
     if let Err(e) = write_desktop_file() {
         warn!("Could not write desktop file: {}", e);
     }
@@ -129,16 +147,16 @@ fn main() {
             "Existing display session detected (wayland={}, x11={}) - running nested (winit)",
             has_wayland, has_x11
         );
-        run_winit();
+        run_winit(extern_name.clone());
     } else {
         info!("No display server found - using DRM/KMS backend (TTY mode)");
-        run_udev();
+        run_udev(extern_name.clone());
     }
 }
 
 // ── DRM/KMS backend (production, bare-metal / TTY) ─────────────────────────
 
-fn run_udev() {
+fn run_udev(extern_name: Option<String>) {
     use smithay::backend::session::libseat::LibSeatSession;
 
     // `LibSeatSession` (this whole function) goes through libseat, which
@@ -194,7 +212,7 @@ fn run_udev() {
         wayland_server::Display::new().expect("Failed to create Wayland display");
 
     let loop_handle = event_loop.handle();
-    let mut st = state::BlueState::new(&loop_handle, display);
+    let mut st = state::BlueState::new_with_extern_name(&loop_handle, display, extern_name.clone());
 
     // Register session notifier - relays libseat session events (VT
     // switch, device pause/resume) into the event loop.
@@ -212,6 +230,14 @@ fn run_udev() {
     }
 
     st.init_ipc(&loop_handle);
+    if let Err(e) = crate::ipc::init_hackerland_ipc(&loop_handle) {
+        warn!("HackerLand control socket failed to start: {e}");
+    }
+    // sde-ipc / extern_ipc is disabled for now (see ipc/mod.rs's note) —
+    // `extern_name` still selects which config.hk / HackerLand socket
+    // this session uses (see config.rs, hackerland_ipc.rs), it just
+    // doesn't also open a second sde-ipc socket until that protocol
+    // gets a proper design pass.
 
     // EIS input-emulation socket — see input_emulation module doc for
     // scope. Not fatal if it fails (e.g. no writable XDG_RUNTIME_DIR in
@@ -253,7 +279,7 @@ fn run_udev() {
 
 // ── Winit backend (nested, dev/VM) ─────────────────────────────────────────
 
-fn run_winit() {
+fn run_winit(extern_name: Option<String>) {
     use smithay::backend::winit;
 
     let event_loop: calloop::EventLoop<'static, state::BlueState> =
@@ -262,7 +288,7 @@ fn run_winit() {
         wayland_server::Display::new().expect("Failed to create Wayland display");
 
     let loop_handle = event_loop.handle();
-    let mut st = state::BlueState::new(&loop_handle, display);
+    let mut st = state::BlueState::new_with_extern_name(&loop_handle, display, extern_name.clone());
 
     // `winit::init` always builds an EGL context against the *host*
     // GL/GLES driver stack (checked against smithay's own
@@ -325,6 +351,14 @@ fn run_winit() {
     }
 
     st.init_ipc(&loop_handle);
+    if let Err(e) = crate::ipc::init_hackerland_ipc(&loop_handle) {
+        warn!("HackerLand control socket failed to start: {e}");
+    }
+    // sde-ipc / extern_ipc is disabled for now (see ipc/mod.rs's note) —
+    // `extern_name` still selects which config.hk / HackerLand socket
+    // this session uses (see config.rs, hackerland_ipc.rs), it just
+    // doesn't also open a second sde-ipc socket until that protocol
+    // gets a proper design pass.
 
     // EIS input-emulation socket — see input_emulation module doc for
     // scope. Not fatal if it fails (e.g. no writable XDG_RUNTIME_DIR in
