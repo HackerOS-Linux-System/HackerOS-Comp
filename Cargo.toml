@@ -1,3 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "wm",
+    "penetration-mode",
+    # NOTE: "hacker-mode" and "cybersecurity-mode" deliberately excluded.
+    # Both are pre-existing "reference copy" crates (their own
+    # Cargo.toml descriptions say so) whose `[dependencies]` point at
+    # `sde-ipc = { path = "../sde" }` — a directory that doesn't exist.
+    # `sde` and `hwde-ipc` were both removed from this workspace: the
+    # generic sde-ipc/hwde-ipc protocol layer is on hold pending a
+    # redesign (see `src/ipc/mod.rs`'s note on `extern_ipc`), and the
+    # WindowSummary/WorkspaceSummary/OutputSummary types hwde-ipc used
+    # to hold moved into `wm/src/summaries.rs` instead — the only two
+    # crates that ever needed them (this workspace's own main crate and
+    # `wm`) already have a direct dependency relationship, so a third
+    # crate purely to share three structs between them added a layer
+    # without adding value. `penetration-mode` gets a real, minimal,
+    # `sde-ipc`-free placeholder manifest instead (see its own
+    # Cargo.toml) so it can at least join the workspace; `hacker-mode`/
+    # `cybersecurity-mode` still can't build until sde-ipc has an actual
+    # design again, not a placeholder crate satisfying a path.
+]
+
 [package]
 name = "hackeros-comp"
 version = "0.1.0"
@@ -173,6 +198,25 @@ tempfile = "3"
 # direct `drm` dependency is ever genuinely needed again, pin it to
 # match whatever version smithay's own `Cargo.lock` resolves to at the
 # time, not an independently-chosen version.
+
+# `~/.config/HackerOS-Comp/config.hk` — see src/config.rs. Same format
+# and crate as every other HackerOS tool's config (hpm, HackerOS
+# repositories, ...): sections + `->`/`-->`/`--->` nesting instead of
+# TOML tables, plus `${...}` interpolation. Verified directly against
+# the real published crate (fetched `hk-parser-0.3.2.crate` from
+# static.crates.io and read its source under src/{value,error,resolve,
+# parser,serialize}.rs) rather than assumed from the docs page alone.
+hk-parser = "0.3.2"
+indexmap = "2"
+# `hackerland` (the `wm` crate) — `src/ipc/hackerland_ipc.rs` uses it
+# by name already (checked directly). It also now holds the
+# WindowSummary/WorkspaceSummary/OutputSummary types that used to live
+# in a separate `hwde-ipc` crate (removed — see `wm/src/summaries.rs`'s
+# module doc) and the `runtime_dir()` helper that used to live there
+# too. `sde-ipc` was removed as well (see ipc/mod.rs's note on
+# `extern_ipc` being disabled for now) — it existed only to support
+# `extern_ipc.rs`, which isn't part of the build at the moment.
+hackerland = { path = "wm" }
 
 [patch.crates-io]
 calloop = { git = "https://github.com/Smithay/calloop.git", tag = "v0.14.0" }
