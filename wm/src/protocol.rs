@@ -1,13 +1,11 @@
 use std::path::PathBuf;
 
 /// Where HackerLand's control socket lives. Deliberately a different file
-/// than any `hwde_ipc::socket_path_for(..)` result (native HWDE's
-/// `comphwde.sock`, or any `--extern-<n>`'s `comphwde-<n>.sock`) even
-/// though it shares the same runtime directory - a HackerLand session is
-/// its own identity speaking its own protocol, not another `--extern-<n>`
-/// target riding on sde-ipc.
+/// than the legacy shell socket (`src/ipc/socket.rs` in the main crate)
+/// even though it shares the same runtime directory — a HackerLand
+/// session is its own identity speaking its own protocol.
 pub fn socket_path() -> PathBuf {
-    hwde_ipc::runtime_dir().join("hackerland.sock")
+    crate::summaries::runtime_dir().join("hackerland.sock")
 }
 
 /// Every `dispatch <action> ...` action comphwde's HackerLand server
