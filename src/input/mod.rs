@@ -4,7 +4,7 @@ use smithay::{
         KeyState, KeyboardKeyEvent,
         PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
         PointerMotionAbsoluteEvent,
-        TouchDownEvent, TouchMotionEvent, TouchUpEvent, TouchCancelEvent, TouchEvent,
+        TouchDownEvent, TouchMotionEvent, TouchUpEvent, TouchCancelEvent,
     },
     desktop::WindowSurfaceType,
     input::{
@@ -20,6 +20,8 @@ use smithay::{
     utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER},
     wayland::seat::WaylandFocus,
 };
+
+pub mod keybind;
 
 use crate::state::BlueState;
 
@@ -233,9 +235,171 @@ fn handle_keyboard<B: InputBackend, E: KeyboardKeyEvent<B>>(
                 }
             }
 
+            // ── config.hk-driven keybindings ────────────────────────────────
+            // Everything above this point is a hardcoded binding. This is
+            // the config-driven path: `Config.keybindings` (see
+            // `src/config.rs`) is compiled into a `Keybindings` matcher
+            // (see `src/input/keybind.rs` for why the parsing/matching
+            // logic lives in its own smithay-free module) and consulted
+            // here for anything a person has actually configured — see
+            // `dispatch_keybind_action` for what each recognized action
+            // name does. Runs after every hardcoded binding above so a
+            // person can't accidentally shadow Alt+Tab/Alt+F4/Escape by
+            // rebinding the same combo to something else in config.hk;
+            // making the hardcoded set itself configurable is real,
+            // separate follow-up work (see ROADMAP.md), not something
+            // this pass changes.
+            if pressed {
+                if let Some(key_name) = keysym_name(sym) {
+                    let modifiers = keybind::Modifiers {
+                        super_: mods.logo,
+                        shift: mods.shift,
+                        ctrl: mods.ctrl,
+                        alt: mods.alt,
+                    };
+                    // Compiled fresh from `state.config.keybindings` on
+                    // every keypress rather than cached on `BlueState` —
+                    // simpler and correctness-first for now (a person's
+                    // typing speed is nowhere near where re-parsing a
+                    // handful of short strings per keypress would be
+                    // measurable), at the cost of doing more work than
+                    // strictly needed per key event. Caching this
+                    // (rebuilt only when `SdeCall::ReloadConfig`/
+                    // HackerLand's `dispatch reload` actually changes
+                    // `state.config`) is real, separate follow-up work —
+                    // see ROADMAP.md.
+                    let (bindings, _parse_errors) = keybind::Keybindings::from_config(&state.config.keybindings);
+                    if let Some(action) = bindings.action_for(modifiers, &key_name) {
+                        let action = action.to_string();
+                        if dispatch_keybind_action(state, &action) {
+                            return FilterResult::Intercept(());
+                        }
+                    }
+                }
+            }
+
             FilterResult::Forward
         },
     );
+}
+
+/// Turns a `Keysym` into the canonical lowercase key-name shape
+/// `keybind::parse_combo` produces (`"q"`, `"return"`, `"f4"`, `"1"`,
+/// ...) — the one part of this feature that genuinely can't be tested
+/// without a real `Keysym` value, kept as its own small, easily-audited
+/// function precisely so that's the *only* untested part (see
+/// `src/input/keybind.rs`'s module doc). Coverage here matches what
+/// `config::default_keybindings()` actually uses today
+/// (letters/digits/`Return`/`Tab`/`Space`/function keys/arrows) rather
+/// than attempting an exhaustive `Keysym -> name` table — extend this
+/// as real key combos need more coverage, rather than guessing ahead of
+/// demand at every key on a keyboard.
+fn keysym_name(sym: Keysym) -> Option<String> {
+    let name = match sym {
+        Keysym::a => "a", Keysym::b => "b", Keysym::c => "c", Keysym::d => "d",
+        Keysym::e => "e", Keysym::f => "f", Keysym::g => "g", Keysym::h => "h",
+        Keysym::i => "i", Keysym::j => "j", Keysym::k => "k", Keysym::l => "l",
+        Keysym::m => "m", Keysym::n => "n", Keysym::o => "o", Keysym::p => "p",
+        Keysym::q => "q", Keysym::r => "r", Keysym::s => "s", Keysym::t => "t",
+        Keysym::u => "u", Keysym::v => "v", Keysym::w => "w", Keysym::x => "x",
+        Keysym::y => "y", Keysym::z => "z",
+        Keysym::_0 => "0", Keysym::_1 => "1", Keysym::_2 => "2", Keysym::_3 => "3",
+        Keysym::_4 => "4", Keysym::_5 => "5", Keysym::_6 => "6", Keysym::_7 => "7",
+        Keysym::_8 => "8", Keysym::_9 => "9",
+        Keysym::F1 => "f1", Keysym::F2 => "f2", Keysym::F3 => "f3", Keysym::F4 => "f4",
+        Keysym::F5 => "f5", Keysym::F6 => "f6", Keysym::F7 => "f7", Keysym::F8 => "f8",
+        Keysym::F9 => "f9", Keysym::F10 => "f10", Keysym::F11 => "f11", Keysym::F12 => "f12",
+        Keysym::Return => "return",
+        Keysym::Tab => "tab",
+        Keysym::space => "space",
+        Keysym::Escape => "escape",
+        Keysym::BackSpace => "backspace",
+        Keysym::Delete => "delete",
+        Keysym::Left => "left",
+        Keysym::Right => "right",
+        Keysym::Up => "up",
+        Keysym::Down => "down",
+        Keysym::Print => "print",
+        _ => return None,
+    };
+    Some(name.to_string())
+}
+
+/// Executes a config-driven keybinding action by name — the recognized
+/// action-name vocabulary `Config.keybindings`'s keys are matched
+/// against (see `config::default_keybindings()` in `src/config.rs` for
+/// the shipped defaults). Returns `true` if `action` was recognized and
+/// handled (so the caller should intercept the keypress rather than
+/// forwarding it to the focused client) — an unrecognized action name
+/// (a typo in someone's `config.hk`, or a name from a future version)
+/// returns `false` rather than panicking, so the keypress just falls
+/// through to the focused client as if nothing were bound to it.
+fn dispatch_keybind_action(state: &mut BlueState, action: &str) -> bool {
+    match action {
+        "close_window" => {
+            if let Some(surface) = state.seat.get_keyboard().unwrap().current_focus() {
+                if let Some(win) = state.window_by_surface(&surface) {
+                    let id = BlueState::window_id(&win);
+                    state.close_window_by_id(id);
+                }
+            }
+            true
+        }
+        "toggle_fullscreen" => {
+            if let Some(surface) = state.seat.get_keyboard().unwrap().current_focus() {
+                if let Some(win) = state.window_by_surface(&surface) {
+                    if let Some(t) = win.toplevel() {
+                        t.with_pending_state(|s| {
+                            if s.states.contains(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen) {
+                                s.states.unset(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen);
+                            } else {
+                                s.states.set(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen);
+                            }
+                        });
+                        t.send_pending_configure();
+                    }
+                }
+            }
+            true
+        }
+        "toggle_floating" => {
+            if let Some(surface) = state.seat.get_keyboard().unwrap().current_focus() {
+                if let Some(win) = state.window_by_surface(&surface) {
+                    let id = BlueState::window_id(&win);
+                    state.toggle_floating_by_id(id);
+                }
+            }
+            true
+        }
+        "cycle_windows" => {
+            // Same behavior as the hardcoded Alt+Tab binding above —
+            // a person who's rebound this action gets the same window
+            // switcher, just under whatever combo they chose instead
+            // of Alt+Tab.
+            if !state.show_switcher {
+                state.show_switcher = true;
+                state.switcher_index = 0;
+            } else {
+                state.cycle_switcher(true);
+            }
+            true
+        }
+        "launch_terminal" => {
+            let _ = std::process::Command::new("sh")
+                .args(["-c", "kitty & || alacritty & || gnome-terminal & || xterm &"])
+                .spawn();
+            true
+        }
+        _ => {
+            if let Some(n) = action.strip_prefix("workspace_").and_then(|s| s.parse::<usize>().ok()) {
+                if n >= 1 {
+                    state.switch_workspace(n - 1);
+                    return true;
+                }
+            }
+            false
+        }
+    }
 }
 
 // ── Pointer motion ────────────────────────────────────────────────────────
