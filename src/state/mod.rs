@@ -17,7 +17,7 @@ use smithay::{
             Display, DisplayHandle, Resource,
         },
     },
-    utils::{Clock, Logical, Monotonic, Point, Serial, Rectangle},
+    utils::{Clock, Logical, Monotonic, Point, Serial, Rectangle, Size},
     wayland::{
         buffer::BufferHandler,
         compositor::{CompositorClientState, CompositorHandler, CompositorState},
@@ -65,6 +65,58 @@ use std::{
     time::{Duration, Instant},
 };
 use tracing::{info, warn};
+
+/// Type alias used throughout the IPC layer (HackerLand's server-side
+/// handlers, `src/ipc/hackerland_ipc.rs`) to refer to the compositor's
+/// state type without every IPC module needing to know it's called
+/// `BlueState` internally — "HWDE" (HackerOS Wayland Desktop
+/// Environment) is this compositor's protocol-facing identity,
+/// `BlueState` is just its Rust struct name.
+pub type HwdeState = BlueState;
+
+/// Which screen edge a pinned surface is docked to — e.g. a panel or
+/// dock reserving screen space for itself. Currently only set via
+/// [`BlueState::pin_surface`] directly; no IPC call drives this today
+/// (there is no IPC call wired to this yet — see ROADMAP.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinnedEdge {
+    Top,
+    Bottom,
+}
+
+/// One surface pinned to a screen edge (a panel or dock registering
+/// itself with the compositor so `output_geometry`-consuming layout
+/// code can reserve space for it).
+#[derive(Debug, Clone)]
+pub struct PinnedSurface {
+    pub app_id: String,
+    pub edge: PinnedEdge,
+    pub thickness_px: u32,
+    /// PID of the process that requested the pin, if known — kept so a
+    /// pin can be cleaned up automatically if that process
+    /// disconnects/dies, without another component having to
+    /// explicitly unpin it first. Not yet wired to any disconnect hook
+    /// — see ROADMAP.md.
+    pub owner_pid: Option<i32>,
+}
+
+/// Minimal wallpaper state: just the current path plus whether a reload
+/// is pending. Actual rendering (loading the image, scaling it to each
+/// output, uploading it as a texture) is `render/mod.rs`'s job — this
+/// struct only tracks *what* the desired wallpaper is, set via
+/// `SdeCall::SetWallpaper`/HackerLand's `dispatch setwallpaper <path>`,
+/// for the render path to notice via `pending_wallpaper_reload` and
+/// pick up on its next frame.
+#[derive(Debug, Clone, Default)]
+pub struct WallpaperState {
+    pub path: Option<std::path::PathBuf>,
+}
+
+impl WallpaperState {
+    pub fn set_path(&mut self, path: impl Into<std::path::PathBuf>) {
+        self.path = Some(path.into());
+    }
+}
 
 // ── IPC window info ────────────────────────────────────────────────────────
 
@@ -376,6 +428,8 @@ pub struct WindowMeta {
     pub app_id: String,
     pub is_fullscreen: bool,
     pub is_minimized: bool,
+    pub is_floating: bool,
+    pub is_maximized: bool,
     pub workspace: usize,
 }
 
@@ -569,12 +623,61 @@ pub struct BlueState {
     // UI state communicated to shell via IPC
     pub start_menu_visible: bool,
     pub fullscreen_menu_visible: bool,
+
+    // ── Config (config.rs) + extern-target identity ─────────────────────
+    /// Loaded from `~/.config/HackerOS-Comp/config.hk` (or
+    /// `config-<name>.hk` for an `--extern` session) at startup, and
+    /// reloadable at runtime via HackerLand's `dispatch reload` — see
+    /// `src/config.rs`.
+    pub config: crate::config::Config,
+    /// `Some(name)` for a `--extern <name>` session (a second,
+    /// independently-launched HWDE target with its own config file and
+    /// HackerLand socket name), `None` for the native session.
+    pub extern_name: Option<String>,
+    pub wallpaper: WallpaperState,
+    /// Set by `SdeCall::SetWallpaper`/HackerLand's `setwallpaper`;
+    /// cleared by `render/mod.rs` once it's picked up the new
+    /// `wallpaper.path` and re-uploaded the texture for every output.
+    pub pending_wallpaper_reload: bool,
+    /// Shared with anything that needs to request a clean shutdown from
+    /// outside the event-loop-owning thread (currently just
+    /// `SdeCall::Shutdown`/HackerLand's `dispatch exit`, both handled
+    /// in-loop today, but `Arc<AtomicBool>` rather than a plain `bool`
+    /// so a future signal handler or cross-thread caller can flip it
+    /// too without needing `&mut BlueState`). `should_exit()` treats
+    /// this and the legacy `should_exit` flag as equivalent — either
+    /// one being set ends the compositor.
+    pub running: Arc<std::sync::atomic::AtomicBool>,
+    /// Workspaces with tiling layout turned on (`SdeCall::SetTiling` /
+    /// HackerLand's `dispatch settiling`) — absence from this set means
+    /// floating-only, presence means comphwde's simple master-stack
+    /// tiling applies. Seeded from `config.general.default_tiling` for
+    /// every workspace at startup (see `BlueState::new`).
+    pub tiling_workspaces: std::collections::HashSet<usize>,
+    /// Surfaces pinned to a screen edge via `SdeCall::PinSurface`,
+    /// keyed by `app_id` (an SDE component pinning again with the same
+    /// `app_id` replaces its previous pin rather than stacking a
+    /// second one).
+    pub pinned_surfaces: HashMap<String, PinnedSurface>,
 }
 
 impl BlueState {
     pub fn new(
         loop_handle: &LoopHandle<'static, Self>,
         display: Display<Self>,
+    ) -> Self {
+        Self::new_with_extern_name(loop_handle, display, None)
+    }
+
+    /// Same as [`BlueState::new`], but for an `--extern <name>` session
+    /// — loads `config-<name>.hk` instead of `config.hk` (see
+    /// `config::load_for`) and records `extern_name` so a later
+    /// `SdeCall::ReloadConfig` reloads the *same* file rather than
+    /// silently falling back to the native session's config.
+    pub fn new_with_extern_name(
+        loop_handle: &LoopHandle<'static, Self>,
+        display: Display<Self>,
+        extern_name: Option<String>,
     ) -> Self {
         let display_handle = display.handle();
         let clock = Clock::new();
@@ -632,6 +735,17 @@ impl BlueState {
         // Clone before moving into the struct — needed for XdgActivationState init
         let display_handle_for_activation = display_handle.clone();
 
+        // Load config.hk (or config-<name>.hk) before the struct literal
+        // below so `workspace_count`/`tiling_workspaces` can be seeded
+        // from it rather than hardcoded — see src/config.rs.
+        let config = crate::config::load_for(extern_name.as_deref());
+        let workspace_count = config.workspaces.count.max(1);
+        let tiling_workspaces: std::collections::HashSet<usize> = if config.general.default_tiling {
+            (0..workspace_count).collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
         BlueState {
             display_handle,
             loop_handle: loop_handle.clone(),
@@ -640,7 +754,7 @@ impl BlueState {
             space: Space::default(),
             popup_manager: PopupManager::default(),
             current_workspace: 0,
-            workspace_count: 4,
+            workspace_count,
             compositor_state,
             xdg_shell_state,
             shm_state,
@@ -704,6 +818,13 @@ impl BlueState {
             super_used: false,
             start_menu_visible: false,
             fullscreen_menu_visible: false,
+            config,
+            extern_name,
+            wallpaper: WallpaperState::default(),
+            pending_wallpaper_reload: false,
+            running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            tiling_workspaces,
+            pinned_surfaces: HashMap::new(),
         }
     }
 
@@ -711,8 +832,12 @@ impl BlueState {
         &self.socket_name
     }
 
+    /// `true` if either the legacy `should_exit` flag or the newer
+    /// `running` flag (settable from outside the event loop, e.g.
+    /// `SdeCall::Shutdown`/HackerLand's `dispatch exit` — see
+    /// `running`'s field doc) says to stop.
     pub fn should_exit(&self) -> bool {
-        self.should_exit
+        self.should_exit || !self.running.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn refresh(&mut self) {
@@ -973,6 +1098,309 @@ impl BlueState {
         if previous != next {
             crate::protocols::ext_workspace::notify_workspace_switched(self, previous, next);
         }
+
+        // Re-run tiling layout for the workspace we just switched to —
+        // covers the case where it was tiled and windows moved onto it
+        // (via `move_window_to_workspace`) while it wasn't the visible
+        // one, so its layout is already correct rather than only
+        // getting recomputed the next time something else changes it.
+        self.apply_tiling_layout(next);
+    }
+
+    /// Moves the window with the given id (see [`Self::window_id`]) to
+    /// `workspace`, clamped to a valid index the same way
+    /// [`Self::switch_workspace`] clamps its target. Doesn't change
+    /// focus or which workspace is currently shown — pair with
+    /// [`Self::switch_workspace`] if the caller wants to follow the
+    /// window to its new workspace (`SdeCall::MoveWindowToWorkspace`
+    /// deliberately doesn't do that automatically, matching Hyprland/
+    /// Wayfire's `movetoworkspace` semantics, which also don't).
+    pub fn move_window_to_workspace(&mut self, id: u64, workspace: usize) {
+        let target = workspace.min(self.workspace_count.saturating_sub(1));
+        let previous = self.window_meta.get(&id).map(|m| m.workspace);
+        if let Some(meta) = self.window_meta.get_mut(&id) {
+            meta.workspace = target;
+            info!("Window {id} moved to workspace {target}");
+        }
+        // Re-tile both the workspace the window left and the one it
+        // joined — either can have gone from N windows to N-1 (need
+        // the master-stack split recomputed) or N-1 to N.
+        if let Some(prev) = previous {
+            self.apply_tiling_layout(prev);
+        }
+        self.apply_tiling_layout(target);
+    }
+
+    /// Turns comphwde's simple master-stack tiling on/off for one
+    /// workspace (`SdeCall::SetTiling`/HackerLand's `dispatch settiling`).
+    /// Immediately re-lays-out the workspace via
+    /// [`Self::apply_tiling_layout`] either way — turning tiling on
+    /// should visibly snap windows into place right away, and turning
+    /// it off leaves existing window positions alone (nothing to
+    /// "un-tile" back to; a person's windows just stop being managed
+    /// going forward).
+    pub fn set_tiling(&mut self, workspace: usize, enabled: bool) {
+        if enabled {
+            self.tiling_workspaces.insert(workspace);
+        } else {
+            self.tiling_workspaces.remove(&workspace);
+        }
+        info!("Workspace {workspace} tiling: {enabled}");
+        self.apply_tiling_layout(workspace);
+    }
+
+    /// Whether `workspace` currently has tiling enabled.
+    pub fn is_tiling(&self, workspace: usize) -> bool {
+        self.tiling_workspaces.contains(&workspace)
+    }
+
+    /// Re-lays-out every tiled, non-floating, non-minimized window on
+    /// `workspace` using [`crate::layout::compute_layout`] — the glue
+    /// between that module's pure geometry math and this compositor's
+    /// real `Space`/`ToplevelSurface` types. See `layout`'s module doc
+    /// for why the actual math lives there instead of inline here: this
+    /// method's only job is "gather the inputs, apply the outputs",
+    /// with no layout logic of its own to get subtly wrong.
+    ///
+    /// No-op if `workspace` isn't in tiling mode ([`Self::is_tiling`])
+    /// or has no primary output yet — every call site below (window
+    /// map/unmap, `set_tiling`, `switch_workspace`,
+    /// `move_window_to_workspace`) can call this unconditionally after
+    /// anything that might have changed a tiled workspace's window
+    /// set, without each one needing to re-check those conditions
+    /// itself.
+    pub fn apply_tiling_layout(&mut self, workspace: usize) {
+        if !self.is_tiling(workspace) {
+            return;
+        }
+        let Some(output_geo) = self.primary_output_geometry() else { return };
+
+        // Only tile windows that are actually on this workspace, not
+        // floating (a floating window opted out of layout management —
+        // same convention `toggle_floating_by_id` establishes), and not
+        // minimized (nothing to place on screen for those). Order
+        // matches `Space::elements()`'s stacking order, so the window
+        // that's been on screen longest tends to stay the master — the
+        // same "oldest window keeps its slot" feel dwm/Hyprland's own
+        // master-stack layouts have, rather than windows visibly
+        // reshuffling master/stack roles every time this runs.
+        let windows: Vec<Window> = self
+            .space
+            .elements()
+            .filter(|w| {
+                let id = Self::window_id(w);
+                self.window_meta.get(&id).map(|m| m.workspace == workspace && !m.is_floating && !m.is_minimized).unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+
+        if windows.is_empty() {
+            return;
+        }
+
+        let area = crate::layout::Rect::new(output_geo.loc.x, output_geo.loc.y, output_geo.size.w, output_geo.size.h);
+        let tiling_config = crate::layout::TilingConfig { gaps_px: self.config.general.gaps_px as i32, ..Default::default() };
+        let rects = crate::layout::compute_layout(area, windows.len(), &tiling_config);
+
+        for (window, rect) in windows.into_iter().zip(rects) {
+            let loc: Point<i32, Logical> = (rect.x, rect.y).into();
+            let size: Size<i32, Logical> = (rect.w.max(1), rect.h.max(1)).into();
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|state| {
+                    state.size = Some(size);
+                });
+                toplevel.send_pending_configure();
+            }
+            self.space.map_element(window, loc, false);
+        }
+    }
+
+    /// Registers (or replaces, if `app_id` already had one) a pinned
+    /// surface — see [`PinnedSurface`]'s doc. Reserving actual screen
+    /// space for it (shrinking `output_geometry` for layout purposes)
+    /// is real follow-up work for whatever computes usable workspace
+    /// area; this method's job is specifically bookkeeping *that* a pin
+    /// exists, matching every other `Sde*`-driven setter on this impl.
+    pub fn pin_surface(&mut self, app_id: String, edge: PinnedEdge, thickness_px: u32, owner_pid: Option<i32>) {
+        info!("Pinning surface '{app_id}' to {edge:?} edge ({thickness_px}px)");
+        self.pinned_surfaces.insert(
+            app_id.clone(),
+            PinnedSurface { app_id, edge, thickness_px, owner_pid },
+        );
+    }
+
+    /// The usable geometry of the primary output (the first output in
+    /// [`Self::outputs`] — comphwde doesn't yet have an explicit
+    /// "primary monitor" concept beyond "the first one connected", see
+    /// ROADMAP.md), in logical pixels. `None` if there are no outputs
+    /// at all yet (briefly true very early in startup, or on a headless
+    /// CI runner with no backend attached).
+    pub fn primary_output_geometry(&self) -> Option<Rectangle<i32, Logical>> {
+        let output = self.outputs.first()?;
+        self.space.output_geometry(output)
+    }
+
+    // ── Window control (SdeCall / HackerLand dispatch actions) ──────────────
+    // Every method below is the compositor-side implementation of one
+    // `SdeCall`/HackerLand `dispatch` action that operates on a single
+    // window by id. Each is a small, focused wrapper: look the window
+    // up via `window_by_id`, mutate `window_meta` (the metadata these
+    // actions are actually about — focus, minimized, maximized,
+    // floating), and where the action has a real client-visible wire
+    // effect too (focus, close, maximize/fullscreen), also drive the
+    // underlying `ToplevelSurface`/`Seat` API. All silently no-op on an
+    // unknown id, same as every other `Sde*`/HackerLand action already
+    // does for a bad id (see `hackerland_ipc.rs`'s
+    // dispatch — a stale id from a client that hasn't heard about a
+    // just-closed window yet shouldn't be a hard error).
+
+    pub fn focus_window_by_id(&mut self, id: u64) {
+        let Some(window) = self.window_by_id(id) else { return };
+        self.space.raise_element(&window, true);
+        if let Some(surface) = window.wl_surface() {
+            if let Some(keyboard) = self.seat.get_keyboard() {
+                let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                keyboard.set_focus(self, Some(surface.into_owned()), serial);
+            }
+        }
+    }
+
+    pub fn close_window_by_id(&mut self, id: u64) {
+        let Some(window) = self.window_by_id(id) else { return };
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.send_close();
+        }
+    }
+
+    pub fn minimize_window_by_id(&mut self, id: u64) {
+        if let Some(meta) = self.window_meta.get_mut(&id) {
+            meta.is_minimized = true;
+        }
+        // Smithay's `Space` has no native show/hide primitive (same
+        // constraint noted in `switch_workspace` above) — actually
+        // hiding the surface's rendered output for "minimized" is the
+        // render path's job, driven off `window_meta[id].is_minimized`,
+        // not this method's.
+    }
+
+    pub fn unminimize_window_by_id(&mut self, id: u64) {
+        if let Some(meta) = self.window_meta.get_mut(&id) {
+            meta.is_minimized = false;
+        }
+        self.focus_window_by_id(id);
+    }
+
+    /// `output_geo` is the primary output's usable area (see
+    /// [`Self::primary_output_geometry`]) — used to size the window to
+    /// fill the screen when `maximized` is `true`. `None` (no output
+    /// yet) still toggles the maximized *state* bit clients see, it
+    /// just can't also resize the surface to match.
+    pub fn maximize_window_by_id(&mut self, id: u64, maximized: bool, output_geo: Option<Rectangle<i32, Logical>>) {
+        let Some(window) = self.window_by_id(id) else { return };
+        if let Some(meta) = self.window_meta.get_mut(&id) {
+            meta.is_floating = meta.is_floating && !maximized; // a maximized window isn't floating
+            meta.is_maximized = maximized;
+        }
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.with_pending_state(|state| {
+                if maximized {
+                    state.states.set(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
+                    if let Some(geo) = output_geo {
+                        state.size = Some(geo.size);
+                    }
+                } else {
+                    state.states.unset(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
+                    state.size = None; // let the client pick its own floating size again
+                }
+            });
+            toplevel.send_pending_configure();
+            if maximized {
+                if let Some(geo) = output_geo {
+                    self.space.map_element(window, geo.loc, true);
+                }
+            }
+        }
+    }
+
+    pub fn toggle_floating_by_id(&mut self, id: u64) {
+        if let Some(meta) = self.window_meta.get_mut(&id) {
+            meta.is_floating = !meta.is_floating;
+            info!("Window {id} floating: {}", meta.is_floating);
+        }
+    }
+
+    // ── Summaries (read-only queries for HackerLand) ─────────────────────
+
+    /// One [`hackerland::summaries::WindowSummary`] per currently-mapped window, in
+    /// `Space` stacking order (bottom to top — matches
+    /// `self.space.elements()`'s own iteration order, which is what
+    /// every other window-iterating method on this impl already relies
+    /// on, e.g. `cycle_switcher`/`apply_switcher_selection` above).
+    pub fn window_summaries(&self) -> Vec<hackerland::summaries::WindowSummary> {
+        self.space
+            .elements()
+            .map(|w| {
+                let id = Self::window_id(w);
+                let meta = self.window_meta.get(&id).cloned().unwrap_or_default();
+                hackerland::summaries::WindowSummary {
+                    id,
+                    title: meta.title,
+                    app_id: meta.app_id,
+                    workspace: meta.workspace,
+                    is_fullscreen: meta.is_fullscreen,
+                    is_minimized: meta.is_minimized,
+                    is_floating: meta.is_floating,
+                    is_maximized: meta.is_maximized,
+                    is_xwayland: w.x11_surface().is_some(),
+                }
+            })
+            .collect()
+    }
+
+    /// One [`hackerland::summaries::WorkspaceSummary`] per configured workspace
+    /// (`0..workspace_count`, regardless of whether it currently has any
+    /// windows — an empty workspace is still a real, switchable
+    /// workspace, same as Hyprland/Wayfire).
+    pub fn workspace_summaries(&self) -> Vec<hackerland::summaries::WorkspaceSummary> {
+        let mut counts = vec![0usize; self.workspace_count];
+        for meta in self.window_meta.values() {
+            if let Some(c) = counts.get_mut(meta.workspace) {
+                *c += 1;
+            }
+        }
+        (0..self.workspace_count)
+            .map(|id| hackerland::summaries::WorkspaceSummary {
+                id,
+                window_count: counts[id],
+                is_tiling: self.is_tiling(id),
+                is_active: id == self.current_workspace,
+            })
+            .collect()
+    }
+
+    /// One [`hackerland::summaries::OutputSummary`] per connected output. The first
+    /// output is reported as primary, matching
+    /// [`Self::primary_output_geometry`]'s same convention.
+    pub fn output_summaries(&self) -> Vec<hackerland::summaries::OutputSummary> {
+        self.outputs
+            .iter()
+            .enumerate()
+            .map(|(i, output)| {
+                let mode = output.current_mode();
+                let scale = output.current_scale().fractional_scale();
+                let loc = self.space.output_geometry(output).map(|geo| geo.loc).unwrap_or_default();
+                hackerland::summaries::OutputSummary {
+                    name: output.name(),
+                    x: loc.x,
+                    y: loc.y,
+                    width: mode.map(|m| m.size.w).unwrap_or(0),
+                    height: mode.map(|m| m.size.h).unwrap_or(0),
+                    refresh_mhz: mode.map(|m| m.refresh).unwrap_or(0),
+                    scale,
+                    is_primary: i == 0,
+                }
+            })
+            .collect()
     }
 }
 
@@ -1072,6 +1500,7 @@ String::new(),
         // protocols/foreign_toplevel.rs) before this call does anything
         // visible to clients — the hook point itself is correct now.
         self.notify_toplevel_mapped(surface_id);
+        self.apply_tiling_layout(self.current_workspace);
 
         info!(
             "New toplevel surface id={} workspace={}",
