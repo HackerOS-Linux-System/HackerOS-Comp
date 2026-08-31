@@ -1,0 +1,52 @@
+! Example ~/.config/HackerOS-Comp/config.hk
+! Copy this file there (or to config-<name>.hk for an `--extern <name>`
+! session) and edit it — see src/config.rs for the full list of keys
+! comphwde reads and what happens if one is missing or malformed
+! (short version: it falls back to a sane default, per field, and logs
+! why — never a hard startup failure over a settings file).
+!
+! Format reference: https://hackeros-linux-system.github.io/HackerOS-Website/tools-docs/hk.html
+
+[general]
+-> gaps_px             => 10
+-> border_px            => 2
+-> focus_follows_mouse  => false
+-> default_tiling       => true
+
+[appearance]
+-> wallpaper              => /usr/share/wallpapers/HackerOS-Wallpapers/Wallpaper1.png
+-> active_border_color    => "#3b82f6"
+-> inactive_border_color  => "#334155"
+-> cursor_theme           => default
+-> cursor_size            => 24
+
+[input]
+-> keyboard_layout    => us
+-> keyboard_variant   => ""
+-> repeat_rate        => 25
+-> repeat_delay       => 600
+-> natural_scroll     => false
+-> tap_to_click       => true
+-> mouse_sensitivity  => 0.0
+
+[workspaces]
+-> count => 5
+-> names => ["code", "web", "chat", "media", "misc"]
+
+! One key per keybinding action -> key combo string. `input/mod.rs`'s
+! keybinding dispatch is what ends up reading these (see config.rs's
+! module doc — this file's job is strictly "parse and validate").
+[keybindings]
+-> close_window        => Super+Q
+-> toggle_fullscreen    => Super+F
+-> toggle_floating      => Super+Space
+-> cycle_windows        => Super+Tab
+-> launch_terminal      => Super+Return
+-> workspace_1          => Super+1
+-> workspace_2          => Super+2
+-> workspace_3          => Super+3
+-> workspace_4          => Super+4
+-> workspace_5          => Super+5
+
+[autostart]
+-> commands => ["blue-panel", "blue-dock"]
