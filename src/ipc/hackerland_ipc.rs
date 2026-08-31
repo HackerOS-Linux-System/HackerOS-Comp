@@ -10,7 +10,7 @@ use crate::ipc::{our_uid, peer_uid, spawn_external_app};
 use crate::state::HwdeState;
 
 pub fn init(handle: &LoopHandle<'static, HwdeState>) -> std::io::Result<()> {
-    let socket_dir = hwde_ipc::runtime_dir();
+    let socket_dir = hackerland::summaries::runtime_dir();
     std::fs::create_dir_all(&socket_dir)?;
     // Same reasoning as ipc.rs's identical step: don't trust umask for a
     // directory that might live under world-traversable /tmp.
@@ -142,17 +142,17 @@ fn dispatch_action(action: &str, args: &[String], state: &mut HwdeState) -> Resu
             Ok(())
         }
         "workspace" => {
-            state.switch_workspace(require_u32(args, 0, "workspace <id>")?);
+            state.switch_workspace(require_usize(args, 0, "workspace <id>")?);
             Ok(())
         }
         "movetoworkspace" => {
             let id = require_u64(args, 0, "movetoworkspace <id> <workspace>")?;
-            let workspace = require_u32(args, 1, "movetoworkspace <id> <workspace>")?;
+            let workspace = require_usize(args, 1, "movetoworkspace <id> <workspace>")?;
             state.move_window_to_workspace(id, workspace);
             Ok(())
         }
         "settiling" => {
-            let workspace = require_u32(args, 0, "settiling <workspace> <on|off>")?;
+            let workspace = require_usize(args, 0, "settiling <workspace> <on|off>")?;
             let enabled = match args.get(1).map(String::as_str) {
                 Some("on") | Some("true") => true,
                 Some("off") | Some("false") => false,
@@ -191,8 +191,8 @@ fn require_u64(args: &[String], idx: usize, usage: &str) -> Result<u64, String> 
     args.get(idx).ok_or_else(|| format!("usage: {usage}"))?.parse::<u64>().map_err(|_| format!("`{}` is not a valid id", args[idx]))
 }
 
-fn require_u32(args: &[String], idx: usize, usage: &str) -> Result<u32, String> {
-    args.get(idx).ok_or_else(|| format!("usage: {usage}"))?.parse::<u32>().map_err(|_| format!("`{}` is not a valid number", args[idx]))
+fn require_usize(args: &[String], idx: usize, usage: &str) -> Result<usize, String> {
+    args.get(idx).ok_or_else(|| format!("usage: {usage}"))?.parse::<usize>().map_err(|_| format!("`{}` is not a valid number", args[idx]))
 }
 
 #[cfg(test)]
