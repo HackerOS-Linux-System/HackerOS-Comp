@@ -1,4 +1,5 @@
 pub mod protocol;
+pub mod summaries;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -121,7 +122,7 @@ fn print_reply(command: &Command, reply: &str) -> anyhow::Result<()> {
 }
 
 fn print_windows_table(json: &str) {
-    let Ok(windows) = serde_json::from_str::<Vec<hwde_ipc::WindowSummary>>(json) else {
+    let Ok(windows) = serde_json::from_str::<Vec<crate::summaries::WindowSummary>>(json) else {
         println!("{json}");
         return;
     };
@@ -149,7 +150,7 @@ fn print_windows_table(json: &str) {
 }
 
 fn print_workspaces_table(json: &str) {
-    let Ok(workspaces) = serde_json::from_str::<Vec<hwde_ipc::WorkspaceSummary>>(json) else {
+    let Ok(workspaces) = serde_json::from_str::<Vec<crate::summaries::WorkspaceSummary>>(json) else {
         println!("{json}");
         return;
     };
@@ -166,7 +167,7 @@ fn print_workspaces_table(json: &str) {
 }
 
 fn print_outputs_table(json: &str) {
-    let Ok(outputs) = serde_json::from_str::<Vec<hwde_ipc::OutputSummary>>(json) else {
+    let Ok(outputs) = serde_json::from_str::<Vec<crate::summaries::OutputSummary>>(json) else {
         println!("{json}");
         return;
     };
