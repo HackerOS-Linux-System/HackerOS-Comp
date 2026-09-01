@@ -107,6 +107,209 @@ fn write_desktop_file() -> std::io::Result<()> {
     fs::write(desktop_path, content)
 }
 
+// ── CLI ──────────────────────────────────────────────────────────────────
+// `hackeros-comp --help` for the user-facing version of this list.
+//
+// Five things this binary can be asked to do:
+//   1. (no arguments) — start a normal HWDE session for Blue
+//      Environment: autostarts whatever `config.hk`'s `[autostart]`
+//      section lists (see `src/config.rs`) once the compositor's
+//      socket is up.
+//   2. `--extern-cybersecurity-mode` / `--extern-penetration-mode` /
+//      `--extern-hacker-mode` — the same kind of session, but reading
+//      `config-<name>.hk` instead of `config.hk` and speaking under a
+//      separate HackerLand socket name (see `config.rs`'s
+//      `config_path_for`) — one of this compositor's three named
+//      alternate identities, not an arbitrary `--extern-<anything>`.
+//   3. `wm [hackerland-args...]` — **not** a new compositor session.
+//      Delegates straight to `hackerland::run` (the `wm` crate's own
+//      client-mode CLI — `windows`/`workspaces`/`outputs`/`dispatch
+//      <action>`), which talks over HackerLand's control socket to an
+//      *already-running* `hackeros-comp` session. Running `hackeros-comp
+//      wm` with no compositor already running just fails to connect to
+//      that socket, the same as running `hackerland` directly would.
+//   4. `one <command> [args...]` — a single-app kiosk session, in the
+//      spirit of `cage`: starts a fresh compositor (TTY fullscreen, or
+//      nested if already inside a display session, same auto-detection
+//      as the default session), spawns exactly `<command> [args...]`
+//      as its only client, and exits the whole compositor the moment
+//      that process exits — there is no "close the window and keep the
+//      session running" for `one`, matching `cage`'s own kiosk
+//      semantics.
+//   5. `custom <command> [args...]` — a normal, full (not single-app-
+//      exiting) compositor session, just autostarting `<command>
+//      [args...]` instead of whatever `config.hk`'s `[autostart]`
+//      section lists — for running a custom app/tool environment under
+//      this compositor without it being a Blue Environment session.
+//
+// No external argument-parsing crate — this is a small, fixed set of
+// shapes, matching the "handrolled `--extern` scan" this replaces
+// (which was already too limited to express three of these five
+// modes).
+
+const KNOWN_EXTERN_TARGETS: &[&str] = &["cybersecurity-mode", "penetration-mode", "hacker-mode"];
+
+enum CliCommand {
+    Help,
+    /// Delegates to `hackerland::run` — see this section's doc, item 3.
+    Wm(Vec<String>),
+    /// A compositor session — the default (`extern_name: None`, `startup:
+    /// None`) or one of the three named `--extern-*` targets, `one`, or
+    /// `custom` (all of which set `startup` to spawn something other
+    /// than `config.hk`'s own `[autostart]` list).
+    Session { extern_name: Option<String>, startup: Option<StartupOverride> },
+}
+
+/// What `one`/`custom` spawn instead of `config.hk`'s `[autostart]`
+/// list, and whether the whole compositor should exit once it does —
+/// see this section's doc, items 4 and 5, for the actual difference
+/// between the two.
+struct StartupOverride {
+    command: String,
+    args: Vec<String>,
+    exit_when_it_exits: bool,
+}
+
+fn parse_cli(argv: &[String]) -> CliCommand {
+    match argv.first().map(String::as_str) {
+        None => CliCommand::Session { extern_name: None, startup: None },
+        Some("--help") | Some("-h") => CliCommand::Help,
+        Some("wm") => CliCommand::Wm(argv[1..].to_vec()),
+        Some("one") | Some("custom") => {
+            let exit_when_it_exits = argv[0] == "one";
+            let Some(command) = argv.get(1) else {
+                eprintln!("usage: hackeros-comp {} <command> [args...]", argv[0]);
+                std::process::exit(1);
+            };
+            CliCommand::Session {
+                extern_name: None,
+                startup: Some(StartupOverride {
+                    command: command.clone(),
+                    args: argv[2..].to_vec(),
+                    exit_when_it_exits,
+                }),
+            }
+        }
+        Some(flag) if flag.starts_with("--extern-") => {
+            let name = &flag["--extern-".len()..];
+            if !KNOWN_EXTERN_TARGETS.contains(&name) {
+                eprintln!(
+                    "unknown extern target '{name}' — known targets: {}",
+                    KNOWN_EXTERN_TARGETS.join(", ")
+                );
+                std::process::exit(1);
+            }
+            CliCommand::Session { extern_name: Some(name.to_string()), startup: None }
+        }
+        Some(other) => {
+            eprintln!("unknown argument: {other}\n\nSee `hackeros-comp --help` for usage.");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn print_help() {
+    println!(
+        r#"hackeros-comp — HackerOS's Wayland compositor for Blue Environment
+
+USAGE:
+    hackeros-comp                          Start a normal Blue Environment session
+                                            (autostarts config.hk's [autostart] list)
+    hackeros-comp --extern-cybersecurity-mode
+    hackeros-comp --extern-penetration-mode
+    hackeros-comp --extern-hacker-mode     Start a session under one of this
+                                            compositor's three named alternate
+                                            identities (config-<name>.hk, its own
+                                            HackerLand socket name)
+    hackeros-comp wm [ARGS...]             Talk to an already-running session's
+                                            HackerLand control socket (windows /
+                                            workspaces / outputs / dispatch <action>)
+                                            — does not start a new session itself
+    hackeros-comp one <COMMAND> [ARGS...]  Single-app kiosk session (cage-style):
+                                            runs COMMAND as the only client,
+                                            fullscreen, exits when it exits
+    hackeros-comp custom <COMMAND> [ARGS...]
+                                            Normal compositor session, autostarting
+                                            COMMAND instead of config.hk's own
+                                            [autostart] list
+
+    -h, --help                             Print this help and exit
+"#
+    );
+}
+
+/// Spawns `command args...` and, if `exit_when_it_exits` is set, spawns a
+/// background thread that blocks on that one child's exit and then flips
+/// `running` to `false` — `run_loop`'s own `state.should_exit()` check
+/// (which already ORs in `!running.load(..)` — see `state/mod.rs`) picks
+/// that up on its next iteration and shuts the compositor down cleanly,
+/// no new plumbing needed beyond the `Arc<AtomicBool>` that already
+/// existed for exactly this kind of "something outside the event loop
+/// wants to stop it" signal.
+fn spawn_one_shot_startup(startup: &StartupOverride, running: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    match std::process::Command::new(&startup.command).args(&startup.args).spawn() {
+        Ok(mut child) => {
+            info!("Spawned '{}' as the session's client", startup.command);
+            if startup.exit_when_it_exits {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                    info!("Kiosk client exited — shutting down compositor (hackeros-comp one)");
+                    running.store(false, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+        }
+        Err(e) => {
+            error!("Failed to spawn '{}': {e}", startup.command);
+            if startup.exit_when_it_exits {
+                // A kiosk session that failed to launch its one and only
+                // client has nothing left to do — exiting immediately
+                // (rather than sitting there running a compositor with
+                // no client and no way to start one) matches `cage`'s
+                // own behavior on a launch failure.
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// Splits `Config.autostart.commands`' entries (each a full command
+/// line, e.g. `"blue-panel --minimal"`) into `(program, args)` — plain
+/// whitespace splitting, deliberately: no quoting/escaping support, so
+/// an autostart entry needing a literal space inside one argument isn't
+/// expressible today. Real, separate follow-up work if that's ever
+/// needed (a small shell-word-splitting routine, not a full shell);
+/// every default/example `config.hk` this project ships only lists bare
+/// program names, which this already handles correctly.
+fn split_command_line(line: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = line.split_whitespace().map(str::to_string);
+    let program = parts.next()?;
+    Some((program, parts.collect()))
+}
+
+/// Called once the compositor's socket + env vars are ready, in both
+/// `run_udev` and `run_winit` — decides what to spawn based on
+/// `startup`:
+///   - `Some(override_)` (from `hackeros-comp one`/`custom`) — spawns
+///     exactly that one command via [`spawn_one_shot_startup`].
+///   - `None` (the default session, or an `--extern-*` one) — spawns
+///     every entry in `state.config.autostart.commands` (see
+///     `src/config.rs`) — previously parsed out of `config.hk` and then
+///     never actually used anywhere, which this fixes.
+fn launch_startup_clients(state: &state::BlueState, startup: Option<StartupOverride>) {
+    match startup {
+        Some(override_) => spawn_one_shot_startup(&override_, state.running.clone()),
+        None => {
+            for line in &state.config.autostart.clone() {
+                let Some((program, args)) = split_command_line(line) else { continue };
+                match std::process::Command::new(&program).args(&args).spawn() {
+                    Ok(_) => info!("Autostarted '{line}'"),
+                    Err(e) => warn!("Failed to autostart '{line}': {e}"),
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     // `init_logging()` is now the only subscriber install — see its
     // doc comment for why this used to double-install (a stderr one
@@ -116,47 +319,53 @@ fn main() {
     // the non-blocking writer), hence binding it here instead of
     // discarding it.
     let _log_guard = init_logging();
-    info!("HackerOS-Comp v0.2 starting...");
 
-    // `--extern <name>` launches a second, independently-configured HWDE
-    // target reading `config-<name>.hk` instead of `config.hk` and
-    // using its own HackerLand socket name — see `src/config.rs`. The
-    // sde-ipc extern-facing socket this used to also open is disabled
-    // for now (see `src/ipc/mod.rs`'s note). Every other CLI flag this
-    // binary understands is untouched; this is deliberately the only
-    // argument parsed here rather than pulling in a full
-    // argument-parsing crate for one optional flag.
-    let extern_name: Option<String> = {
-        let args: Vec<String> = std::env::args().collect();
-        args.iter().position(|a| a == "--extern").and_then(|i| args.get(i + 1)).cloned()
-    };
-    if let Some(name) = &extern_name {
-        info!("Launching as extern target '{name}'");
-    }
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match parse_cli(&argv) {
+        CliCommand::Help => {
+            print_help();
+        }
+        CliCommand::Wm(wm_args) => {
+            // Client mode only — see this file's CLI doc, item 3. Does
+            // not touch logging/session setup below at all; a
+            // successful `hackerland::run` already printed whatever
+            // the person asked for and returns normally.
+            if let Err(e) = hackerland::run(&wm_args) {
+                eprintln!("hackerland: {e}");
+                std::process::exit(1);
+            }
+        }
+        CliCommand::Session { extern_name, startup } => {
+            info!("HackerOS-Comp v0.2 starting...");
+            if let Some(name) = &extern_name {
+                info!("Launching as extern target '{name}'");
+            }
 
-    if let Err(e) = write_desktop_file() {
-        warn!("Could not write desktop file: {}", e);
-    }
+            if let Err(e) = write_desktop_file() {
+                warn!("Could not write desktop file: {}", e);
+            }
 
-    // Detect if we already have a display server
-    let has_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
-    let has_x11 = std::env::var("DISPLAY").is_ok();
+            // Detect if we already have a display server
+            let has_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+            let has_x11 = std::env::var("DISPLAY").is_ok();
 
-    if has_wayland || has_x11 {
-        warn!(
-            "Existing display session detected (wayland={}, x11={}) - running nested (winit)",
-            has_wayland, has_x11
-        );
-        run_winit(extern_name.clone());
-    } else {
-        info!("No display server found - using DRM/KMS backend (TTY mode)");
-        run_udev(extern_name.clone());
+            if has_wayland || has_x11 {
+                warn!(
+                    "Existing display session detected (wayland={}, x11={}) - running nested (winit)",
+                    has_wayland, has_x11
+                );
+                run_winit(extern_name, startup);
+            } else {
+                info!("No display server found - using DRM/KMS backend (TTY mode)");
+                run_udev(extern_name, startup);
+            }
+        }
     }
 }
 
 // ── DRM/KMS backend (production, bare-metal / TTY) ─────────────────────────
 
-fn run_udev(extern_name: Option<String>) {
+fn run_udev(extern_name: Option<String>, startup: Option<StartupOverride>) {
     use smithay::backend::session::libseat::LibSeatSession;
 
     // `LibSeatSession` (this whole function) goes through libseat, which
@@ -274,12 +483,14 @@ fn run_udev(extern_name: Option<String>) {
     std::env::set_var("XDG_SESSION_TYPE", "wayland");
     std::env::set_var("XDG_CURRENT_DESKTOP", "Blue");
 
+    launch_startup_clients(&st, startup);
+
     run_loop(event_loop, st);
 }
 
 // ── Winit backend (nested, dev/VM) ─────────────────────────────────────────
 
-fn run_winit(extern_name: Option<String>) {
+fn run_winit(extern_name: Option<String>, startup: Option<StartupOverride>) {
     use smithay::backend::winit;
 
     let event_loop: calloop::EventLoop<'static, state::BlueState> =
@@ -390,6 +601,8 @@ fn run_winit(extern_name: Option<String>) {
     if let Some(xdisp) = st.x11_display {
         std::env::set_var("DISPLAY", format!(":{}", xdisp));
     }
+
+    launch_startup_clients(&st, startup);
 
     run_loop(event_loop, st);
 }
