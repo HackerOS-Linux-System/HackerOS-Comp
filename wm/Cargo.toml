@@ -1,6 +1,6 @@
 [package]
 name = "hackerland"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "HackerLand: comphwde's own window manager identity and control protocol, in the spirit of Hyprland/Wayfire's own IPC (a plaintext `dispatch <action> [args...]` / query socket). This crate defines the wire protocol (`protocol` module, shared with comphwde's own server-side src/hackerland_ipc.rs so the two can't drift apart) plus the window/workspace/output summary shapes those queries return (`summaries` module), and implements the `comphwde wm` subcommand's client half: `comphwde wm` with no further arguments launches a HackerLand session; `comphwde wm <command> [args...]` instead sends one command to an already-running HackerLand session and prints the reply."
 license = "GPL-3.0"
