@@ -442,11 +442,23 @@ fn run_udev(extern_name: Option<String>, startup: Option<StartupOverride>) {
     if let Err(e) = crate::ipc::init_hackerland_ipc(&loop_handle) {
         warn!("HackerLand control socket failed to start: {e}");
     }
-    // sde-ipc / extern_ipc is disabled for now (see ipc/mod.rs's note) —
-    // `extern_name` still selects which config.hk / HackerLand socket
-    // this session uses (see config.rs, hackerland_ipc.rs), it just
-    // doesn't also open a second sde-ipc socket until that protocol
-    // gets a proper design pass.
+    // `--extern-<name>` control socket (the protocol `--extern-hacker-mode`/
+    // `--extern-cybersecurity-mode`/`--extern-penetration-mode` sessions are
+    // actually driven over — see `src/ipc/extern_ipc.rs` and
+    // `src/ipc/protocol.rs`). Only opened for an `--extern-*` session, same
+    // as `extern_name` itself already only being `Some` in that case — a
+    // plain default session has no `--extern-<name>` client to serve this
+    // socket to, so there's nothing to open. Not fatal if it fails: a
+    // session that fails to expose this socket still has a perfectly usable
+    // Wayland compositor underneath it, just without external process
+    // control (e.g. `hacker-mode-session`'s `hacker-mode-ipcctl launch`)
+    // able to reach it — same "warn, don't exit" treatment already given to
+    // `init_hackerland_ipc` and the EIS socket below.
+    if let Some(name) = extern_name.clone() {
+        if let Err(e) = crate::ipc::init_extern_ipc(&loop_handle, name) {
+            warn!("extern-ipc control socket failed to start: {e}");
+        }
+    }
 
     // EIS input-emulation socket — see input_emulation module doc for
     // scope. Not fatal if it fails (e.g. no writable XDG_RUNTIME_DIR in
@@ -565,11 +577,16 @@ fn run_winit(extern_name: Option<String>, startup: Option<StartupOverride>) {
     if let Err(e) = crate::ipc::init_hackerland_ipc(&loop_handle) {
         warn!("HackerLand control socket failed to start: {e}");
     }
-    // sde-ipc / extern_ipc is disabled for now (see ipc/mod.rs's note) —
-    // `extern_name` still selects which config.hk / HackerLand socket
-    // this session uses (see config.rs, hackerland_ipc.rs), it just
-    // doesn't also open a second sde-ipc socket until that protocol
-    // gets a proper design pass.
+    // `--extern-<name>` control socket — see `run_udev`'s identical block
+    // above for the full explanation; nested (winit) sessions need this
+    // exactly as much as bare-metal ones do (e.g. a developer running
+    // `hacker-mode-session` from inside an existing desktop session for
+    // testing — the same `--extern-hacker-mode` client either way).
+    if let Some(name) = extern_name.clone() {
+        if let Err(e) = crate::ipc::init_extern_ipc(&loop_handle, name) {
+            warn!("extern-ipc control socket failed to start: {e}");
+        }
+    }
 
     // EIS input-emulation socket — see input_emulation module doc for
     // scope. Not fatal if it fails (e.g. no writable XDG_RUNTIME_DIR in
