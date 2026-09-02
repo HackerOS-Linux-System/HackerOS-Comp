@@ -3,7 +3,4 @@
 
 > cargo build --release
 ;; install mising
-;; > sudo apt install libudev-dev 
-;; > sudo apt install libseat-dev
-;; > sudo apt install libinput-dev 
-;; > sudo apt install libgbm-dev
+;; > sudo apt install libudev-dev libseat-dev libinput-dev libgbm-dev libpixman-1-dev libxkbcommon-dev
