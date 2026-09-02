@@ -1,1 +1,97 @@
+name: Test
 
+# Two jobs, split by weight:
+#
+#   test-pure         - the workspace members with no system-library
+#                        dependencies at all (`wm`/hackerland,
+#                        `hacker-mode-ipc`, `penetration-mode-ipc`) -
+#                        fast, no apt install, no Smithay checkout.
+#   test-compositor    - the root `hackeros-comp` package itself, which
+#                        needs the same system libraries `build.yml`
+#                        installs (Wayland/xkbcommon/libinput/DRM/GBM/
+#                        EGL/Vulkan/pixman) and the full Smithay
+#                        dependency tree, just to compile its own test
+#                        binary - same cost as a real build, so kept
+#                        separate rather than blocking the fast job on
+#                        it.
+#
+# `test-pure` covers, among other things, `hacker-mode-ipc`'s own wire-
+# protocol tests (`request_round_trips_through_json`,
+# `socket_path_matches_hackeros_comp_naming`, ...) - the client-side half
+# of the `--extern-hacker-mode` protocol. `test-compositor` covers the
+# server-side half indirectly: `src/ipc/extern_ipc.rs` and `src/ipc/
+# protocol.rs` have no dedicated `#[cfg(test)]` module of their own yet,
+# but `cargo test` still fully type-checks and compiles them as part of
+# the `hackeros-comp` binary - a real compile failure there fails this
+# job just as surely as a failing `#[test]` would.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-pure:
+    name: cargo test (pure-Rust workspace members)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry/build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: hackeros-comp-test-pure
+
+      - name: cargo test -p hackerland -p hacker-mode-ipc -p penetration-mode-ipc
+        # `--locked` here (unlike test-compositor) is safe and desirable:
+        # none of these three crates touch the git-pinned `smithay`
+        # dependency, so there's nothing timing-sensitive about locking
+        # them to the committed Cargo.lock.
+        run: cargo test --locked -p hackerland -p hacker-mode-ipc -p penetration-mode-ipc
+
+  test-compositor:
+    name: cargo test (hackeros-comp)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libwayland-dev wayland-protocols \
+            libxkbcommon-dev \
+            libinput-dev libudev-dev libseat-dev \
+            libdrm-dev libgbm-dev \
+            libegl1-mesa-dev libgles2-mesa-dev \
+            libvulkan-dev \
+            libpixman-1-dev \
+            libssl-dev
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry/build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: hackeros-comp-test-compositor
+
+      - name: cargo test (root package)
+        run: cargo test --release
