@@ -1,14 +1,18 @@
 [package]
 name = "hacker-mode-ipc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Reference copy, within the comphwde/HWDE workspace, of the client side of the --extern-hacker-mode wire protocol (identical to sde-ipc's protocol - see this crate's module docs). Not linked into the comphwde binary; kept here purely as workspace-local documentation and a target for this workspace's own protocol tests. Hacker Mode's actually shipped binaries (the Tauri shell and its hacker-mode-ipcctl helper) vendor their own separate, standalone copy of this crate in their own repository instead of depending on this one - see the module docs below for why."
+description = "Reference copy, within the hackeros-comp workspace, of the client side of the --extern-hacker-mode wire protocol served by src/ipc/extern_ipc.rs (wire-compatible with it by construction - see this crate's module docs and src/ipc/protocol.rs's own doc comment). Not linked into the hackeros-comp binary; kept here purely as workspace-local documentation and a target for this workspace's own protocol tests, now that --extern-hacker-mode has a real server implementation to test against. Hacker Mode's actually shipped binaries (the Tauri shell and its hacker-mode-ipcctl helper) vendor their own separate, standalone copy of this same protocol in their own repository instead of depending on this one - see the module docs below for why."
 license = "GPL-3.0"
 
 [dependencies]
-# Same generic extern-mode protocol/transport every `--extern-<name>`
-# target speaks - see this crate's module docs for why we depend on it
-# instead of duplicating it here.
-sde-ipc = { path = "../sde" }
+# Deliberately self-contained: this crate vendors its own copy of the
+# `--extern-<name>` wire protocol (see the module docs below) instead of
+# depending on a shared crate for it, matching the exact same choice
+# Hacker Mode's own shipped `hacker-mode-ipc` makes in its own
+# repository - see that crate's Cargo.toml description. `src/ipc/
+# protocol.rs`, in this workspace's main crate, makes the same choice
+# for the server side, for the same reason (see its own module doc).
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "1"
