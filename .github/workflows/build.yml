@@ -1,1 +1,75 @@
+name: Build
 
+# Builds hackeros-comp from source: installs the system libraries the
+# Smithay-based compositor links against (Wayland, xkbcommon, libinput,
+# libseat, DRM/GBM, EGL/GLES, Vulkan headers, pixman - see this
+# workspace's own `build.hl` and `Cargo.toml`'s `smithay = { ... features
+# = [...] }` block for why each one is there), then runs the same build
+# `build.hl`'s own `> cargo build --release` target runs locally.
+#
+# Deliberately builds the root package only (`cargo build --release`,
+# no `--workspace`) - same reasoning `build.hl` documents: the reference-
+# copy crates (`hacker-mode/`, `penetration-mode/`) are workspace members
+# for `cargo metadata`/dependency-resolution purposes, not things this
+# repository ships a binary for. `test.yml` is what actually builds and
+# tests those.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: cargo build --release
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libwayland-dev wayland-protocols \
+            libxkbcommon-dev \
+            libinput-dev libudev-dev libseat-dev \
+            libdrm-dev libgbm-dev \
+            libegl1-mesa-dev libgles2-mesa-dev \
+            libvulkan-dev \
+            libpixman-1-dev \
+            libssl-dev
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry/build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Keyed off Cargo.lock so a bump of the pinned Smithay `rev` (or
+          # any other dependency) invalidates the cache instead of
+          # silently reusing a stale build.
+          shared-key: hackeros-comp-build
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: Upload built binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: hackeros-comp-${{ github.sha }}
+          path: target/release/hackeros-comp
+          if-no-files-found: error
+          retention-days: 14
