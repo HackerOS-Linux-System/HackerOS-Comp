@@ -5,11 +5,14 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::rc::Rc;
 use std::time::Duration;
 
-use sde_ipc::{PinnedEdge as SdePinnedEdge, SdeCall, SdeEvent, SdeEventMessage, SdeOutcome, SdeRequest, SdeResponse, SdeResult};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 
+use super::protocol::{
+    PinnedEdge as SdePinnedEdge, SdeCall, SdeEvent, SdeEventMessage, SdeOutcome, SdeOutputInfo,
+    SdeRequest, SdeResponse, SdeResult, SdeWindowInfo, SdeWorkspaceInfo,
+};
 use crate::state::{HwdeState, PinnedEdge};
 
 /// How often the diff tick re-checks window/workspace state for
@@ -20,34 +23,37 @@ type Subscribers = Rc<RefCell<Vec<UnixStream>>>;
 
 /// Last-broadcast state, compared against on every [`DIFF_TICK`] to decide
 /// whether there's anything new to send. Lives for the lifetime of the
-/// diff timer closure (one per `init()` call, i.e. one per comphwde
+/// diff timer closure (one per `init()` call, i.e. one per hackeros-comp
 /// process) - not shared with anything else, so a plain owned struct
 /// captured by the timer closure is enough; no `Rc`/`RefCell` needed here
 /// (unlike `subscribers`, which the accept-loop closure also touches).
 #[derive(Default)]
 struct LastBroadcast {
-    windows: Vec<sde_ipc::SdeWindowInfo>,
-    workspaces: Vec<sde_ipc::SdeWorkspaceInfo>,
+    windows: Vec<SdeWindowInfo>,
+    workspaces: Vec<SdeWorkspaceInfo>,
 }
 
-/// Starts listening on `sde_ipc::socket_path_for(extern_name)`, and starts
+/// Starts listening on `protocol::socket_path_for(extern_name)`, and starts
 /// the [`DIFF_TICK`] event-broadcast timer alongside it. Otherwise
-/// identical in shape to `ipc::init` - see that function's comments for
-/// the reasoning behind the directory/socket permission handling, which
-/// applies here unchanged (extern mode is no less a local-only control
-/// channel than native mode is).
+/// identical in shape to `socket::init_ipc` - see that function's comments
+/// for the reasoning behind the directory/socket permission handling,
+/// which applies here unchanged (extern mode is no less a local-only
+/// control channel than native mode is).
 pub fn init(handle: &LoopHandle<'static, HwdeState>, extern_name: String) -> std::io::Result<()> {
-    let socket_dir = sde_ipc::runtime_dir();
+    let socket_dir = super::protocol::runtime_dir();
     std::fs::create_dir_all(&socket_dir)?;
     std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))?;
 
-    let socket_path = sde_ipc::socket_path_for(&extern_name);
-    let _ = std::fs::remove_file(&socket_path);
+    let socket_path = super::protocol::socket_path_for(&extern_name);
+    let _ = std::fs::remove_file(&socket_path); // stale socket from a crashed run
 
     let listener = UnixListener::bind(&socket_path)?;
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    tracing::info!("comphwde sde-ipc listening on {} (extern target: {extern_name})", socket_path.display());
+    tracing::info!(
+        "hackeros-comp extern-ipc listening on {} (extern target: {extern_name})",
+        socket_path.display()
+    );
 
     let subscribers: Subscribers = Rc::new(RefCell::new(Vec::new()));
 
@@ -57,17 +63,30 @@ pub fn init(handle: &LoopHandle<'static, HwdeState>, extern_name: String) -> std
         .insert_source(source, move |_, listener, state| {
             loop {
                 match listener.accept() {
-                    Ok((stream, _addr)) => handle_connection(stream, state, &subs_for_accept),
+                    Ok((stream, _addr)) => {
+                        // Same-user-only, exactly like `hackerland_ipc`'s
+                        // socket - this is a local control channel, not
+                        // meant to be reachable by any other account on
+                        // the same host regardless of what the socket's
+                        // file permissions alone would already prevent.
+                        if super::peer_uid(&stream) != Some(super::our_uid()) {
+                            tracing::warn!(
+                                "extern-ipc: rejected connection with unknown or mismatched peer credentials"
+                            );
+                            continue;
+                        }
+                        handle_connection(stream, state, &subs_for_accept)
+                    }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(err) => {
-                        tracing::warn!("sde-ipc: accept failed: {err}");
+                        tracing::warn!("extern-ipc: accept failed: {err}");
                         break;
                     }
                 }
             }
             Ok(PostAction::Continue)
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("failed to register sde-ipc listener: {e}")))?;
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("failed to register extern-ipc listener: {e}")))?;
 
     let subs_for_timer = subscribers;
     let mut last = LastBroadcast::default();
@@ -76,7 +95,7 @@ pub fn init(handle: &LoopHandle<'static, HwdeState>, extern_name: String) -> std
             broadcast_if_changed(state, &subs_for_timer, &mut last);
             TimeoutAction::ToDuration(DIFF_TICK)
         })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("failed to register sde-ipc diff timer: {e}")))?;
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("failed to register extern-ipc diff timer: {e}")))?;
 
     Ok(())
 }
@@ -96,7 +115,7 @@ fn handle_connection(stream: UnixStream, state: &mut HwdeState, subscribers: &Su
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(err) => {
-            tracing::warn!("sde-ipc: failed to clone stream: {err}");
+            tracing::warn!("extern-ipc: failed to clone stream: {err}");
             return;
         }
     });
@@ -112,9 +131,9 @@ fn handle_connection(stream: UnixStream, state: &mut HwdeState, subscribers: &Su
         Err(err) => {
             // We don't know the request id if parsing failed entirely -
             // best effort: echo back 0, which no real request should ever
-            // use (`sde_ipc::call`'s ids start at 1), so a client that
-            // happens to check will at least see a mismatch rather than a
-            // false positive match.
+            // use (client `call()` helpers all start ids at 1), so a
+            // client that happens to check will at least see a mismatch
+            // rather than a false positive match.
             send(&writer, &SdeResponse { id: 0, outcome: SdeOutcome::Err { message: format!("malformed request: {err}") } });
             return;
         }
@@ -123,7 +142,7 @@ fn handle_connection(stream: UnixStream, state: &mut HwdeState, subscribers: &Su
     if matches!(request.call, SdeCall::Subscribe) {
         // Acknowledge, then keep the connection open as an event stream
         // instead of closing it like every other call does - see the
-        // module doc comment and `sde-ipc`'s "Push events" section.
+        // module doc comment.
         if !send(&writer, &SdeResponse { id: request.id, outcome: SdeOutcome::Ok { result: SdeResult::None } }) {
             return;
         }
@@ -131,9 +150,9 @@ fn handle_connection(stream: UnixStream, state: &mut HwdeState, subscribers: &Su
             Ok(subscriber_stream) => {
                 let _ = subscriber_stream.set_nonblocking(true);
                 subscribers.borrow_mut().push(subscriber_stream);
-                tracing::info!("sde-ipc: new subscriber ({} total)", subscribers.borrow().len());
+                tracing::info!("extern-ipc: new subscriber ({} total)", subscribers.borrow().len());
             }
-            Err(err) => tracing::warn!("sde-ipc: failed to register subscriber: {err}"),
+            Err(err) => tracing::warn!("extern-ipc: failed to register subscriber: {err}"),
         }
         // `writer`/`reader` drop here, but the socket itself stays open
         // because `subscribers` holds a cloned file descriptor to it.
@@ -150,17 +169,28 @@ fn send(writer: &UnixStream, response: &SdeResponse) -> bool {
         Ok(mut out) => {
             out.push('\n');
             if let Err(err) = w.write_all(out.as_bytes()) {
-                tracing::warn!("sde-ipc: failed to write response: {err}");
+                tracing::warn!("extern-ipc: failed to write response: {err}");
                 false
             } else {
                 true
             }
         }
         Err(err) => {
-            tracing::warn!("sde-ipc: failed to serialize response: {err}");
+            tracing::warn!("extern-ipc: failed to serialize response: {err}");
             false
         }
     }
+}
+
+/// Current window summaries, converted straight to their wire type - see
+/// `protocol::SdeWindowInfo`'s `From` impl.
+fn sde_windows(state: &HwdeState) -> Vec<SdeWindowInfo> {
+    state.window_summaries().into_iter().map(SdeWindowInfo::from).collect()
+}
+
+/// Current workspace summaries, converted straight to their wire type.
+fn sde_workspaces(state: &HwdeState) -> Vec<SdeWorkspaceInfo> {
+    state.workspace_summaries().into_iter().map(SdeWorkspaceInfo::from).collect()
 }
 
 /// The [`DIFF_TICK`] callback: rebuilds current window/workspace
@@ -172,8 +202,8 @@ fn broadcast_if_changed(state: &mut HwdeState, subscribers: &Subscribers, last: 
         return;
     }
 
-    let windows = state.sde_window_summaries();
-    let workspaces: Vec<sde_ipc::SdeWorkspaceInfo> = state.workspace_summaries().into_iter().map(into_sde_workspace).collect();
+    let windows = sde_windows(state);
+    let workspaces = sde_workspaces(state);
 
     let mut events: Vec<SdeEvent> = Vec::new();
     if windows != last.windows {
@@ -206,7 +236,6 @@ fn broadcast_if_changed(state: &mut HwdeState, subscribers: &Subscribers, last: 
             // never stall the compositor's event loop. A `WouldBlock`
             // (or any other write error) drops that subscriber - its
             // next reconnect + fresh `ListWindows`/`ListWorkspaces` call
-            // (which `sde-panel`/`sde-dock` already do on (re)connect)
             // resyncs it. Note: a `WouldBlock` *mid* multi-line write
             // could in principle leave a partial line in the client's
             // read buffer; low-probability for these small payloads over
@@ -217,7 +246,7 @@ fn broadcast_if_changed(state: &mut HwdeState, subscribers: &Subscribers, last: 
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(err) => {
-                    tracing::debug!("sde-ipc: dropping subscriber: {err}");
+                    tracing::debug!("extern-ipc: dropping subscriber: {err}");
                     return false;
                 }
             }
@@ -242,7 +271,7 @@ fn dispatch(call: SdeCall, state: &mut HwdeState, peer_pid: Option<i32>) -> SdeO
             ok(SdeResult::None)
         }
 
-        SdeCall::ListWindows => ok(SdeResult::Windows(state.sde_window_summaries())),
+        SdeCall::ListWindows => ok(SdeResult::Windows(sde_windows(state))),
 
         SdeCall::FocusWindow { id } => {
             state.focus_window_by_id(id);
@@ -270,7 +299,7 @@ fn dispatch(call: SdeCall, state: &mut HwdeState, peer_pid: Option<i32>) -> SdeO
             ok(SdeResult::None)
         }
 
-        SdeCall::ListWorkspaces => ok(SdeResult::Workspaces(state.workspace_summaries().into_iter().map(into_sde_workspace).collect())),
+        SdeCall::ListWorkspaces => ok(SdeResult::Workspaces(sde_workspaces(state))),
 
         SdeCall::SwitchWorkspace { id } => {
             state.switch_workspace(id);
@@ -296,14 +325,16 @@ fn dispatch(call: SdeCall, state: &mut HwdeState, peer_pid: Option<i32>) -> SdeO
 
         SdeCall::ReloadConfig => {
             state.config = crate::config::load_for(state.extern_name.as_deref());
-            tracing::info!("compositor.toml reloaded via sde-ipc");
+            tracing::info!("compositor.toml reloaded via extern-ipc");
             ok(SdeResult::None)
         }
 
-        SdeCall::ListOutputs => ok(SdeResult::Outputs(state.output_summaries().into_iter().map(into_sde_output).collect())),
+        SdeCall::ListOutputs => ok(SdeResult::Outputs(
+            state.output_summaries().into_iter().map(SdeOutputInfo::from).collect(),
+        )),
 
         SdeCall::Shutdown => {
-            tracing::info!("shutdown requested via sde-ipc");
+            tracing::info!("shutdown requested via extern-ipc");
             state.running.store(false, std::sync::atomic::Ordering::SeqCst);
             ok(SdeResult::None)
         }
@@ -314,34 +345,6 @@ fn dispatch(call: SdeCall, state: &mut HwdeState, peer_pid: Option<i32>) -> SdeO
         // would mean `handle_connection`'s `matches!` check above it was
         // bypassed somehow.
         SdeCall::Subscribe => SdeOutcome::Err { message: "Subscribe must be the only call on a connection".to_string() },
-    }
-}
-
-// hwde_ipc::WorkspaceSummary/OutputSummary -> the sde-ipc equivalents.
-// (Windows go through `HwdeState::sde_window_summaries` directly instead -
-// see that method's doc comment for why.) `state.rs`'s summary builders
-// and `sde-ipc`'s types exist independently of each other (see that
-// crate's module docs), so this little adapter layer is the one place
-// that has to know both shapes at once - everything else in the
-// compositor keeps working exactly as it did before extern mode existed.
-fn into_sde_workspace(w: hwde_ipc::WorkspaceSummary) -> sde_ipc::SdeWorkspaceInfo {
-    sde_ipc::SdeWorkspaceInfo {
-        id: w.id,
-        name: format!("{}", w.id + 1),
-        window_count: w.window_count,
-        tiling_enabled: w.is_tiling,
-        active: w.is_active,
-    }
-}
-
-fn into_sde_output(o: hwde_ipc::OutputSummary) -> sde_ipc::SdeOutputInfo {
-    sde_ipc::SdeOutputInfo {
-        name: o.name,
-        width: o.width,
-        height: o.height,
-        refresh_mhz: o.refresh_mhz,
-        scale: o.scale,
-        primary: o.is_primary,
     }
 }
 
