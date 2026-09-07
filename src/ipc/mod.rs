@@ -2,17 +2,24 @@ mod messages;
 mod socket;
 mod handler;
 mod hackerland_ipc;
-// `extern_ipc` (the sde-ipc-based protocol for external SDE apps) is
-// deliberately disabled for now, along with the `sde` crate it depends
-// on — see `sde`'s removal in this same change and the project's own
-// "further work" notes: the sde-ipc protocol surface needs a proper
-// design pass, not more IPC code layered on top of the current draft.
-// `hackerland_ipc` (comphwde's own HackerLand control protocol, which
-// only depends on `hwde-ipc`, not `sde`) is unaffected and still wired
-// in below.
-// mod extern_ipc;
+// The `--extern-<name>` control protocol (`--extern-cybersecurity-mode` /
+// `--extern-penetration-mode` / `--extern-hacker-mode`) — wire types +
+// socket-path helpers live in `protocol` (this crate's own, no external
+// `sde`/`sde-ipc` crate involved — see that module's doc comment for why),
+// the actual Unix-socket server in `extern_ipc`. `hackerland_ipc`
+// (hackeros-comp's own HackerLand control protocol) is a separate,
+// unrelated socket and stays wired in below unchanged.
+mod protocol;
+mod extern_ipc;
 
 pub use hackerland_ipc::init as init_hackerland_ipc;
+pub use extern_ipc::init as init_extern_ipc;
+#[allow(unused_imports)]
+pub use protocol::{
+    PinnedEdge, SdeCall, SdeEvent, SdeEventMessage, SdeOutcome, SdeOutputInfo, SdeRequest,
+    SdeResponse, SdeResult, SdeWindowInfo, SdeWorkspaceInfo, runtime_dir as extern_ipc_runtime_dir,
+    socket_path_for as extern_ipc_socket_path_for,
+};
 
 // ── Shared peer-credential + process-spawning helpers ───────────────────
 // Used by every one of comphwde's Unix-socket IPC surfaces
