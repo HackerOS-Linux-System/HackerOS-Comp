@@ -28,13 +28,38 @@ pub fn init_idle(
 
 fn on_idle(state: &mut BlueState) {
     if state.is_idle { return; }
+    // A client holding an idle-inhibitor (idle_inhibit.rs —
+    // zwp_idle_inhibit_manager_v1, the protocol a video player,
+    // presentation app, or game uses to say "don't blank the screen
+    // while I'm the focused/visible content") was never actually
+    // checked here despite this exact function being named in that
+    // file's own doc comment as the place that should check it. The
+    // practical effect: idle-inhibit had zero effect compositor-wide —
+    // the screen would still blank during a video or presentation, the
+    // one thing that protocol exists to prevent. Doesn't cancel the
+    // timer itself, just skips blanking *this* cycle — once the
+    // inhibitor is released, the next timeout (already re-armed below
+    // regardless of this early return) blanks normally.
+    if state.is_idle_inhibited() {
+        info!("Idle timeout reached, but a client holds an idle inhibitor — not blanking");
+        return;
+    }
     state.is_idle = true;
     info!("System idle — blanking outputs");
 
-    // Blank all outputs via DPMS or wlr-output-power-management
+    // Blank all outputs via DPMS or wlr-output-power-management. Kept
+    // as a single `sh -c "... || ..."` spawn (not rewritten to two
+    // separate `Command::new(prog).args([...])` calls) deliberately:
+    // this runs on a background timer, not in response to a Wayland
+    // request, so nothing here can be attacker-supplied the way the
+    // shell-injection issues found elsewhere in this project's audit
+    // were (`name` comes from DRM/the kernel, not client input) — and
+    // spawning a shell is what lets `||` fall back to `xset`
+    // asynchronously in the child process without this compositor
+    // itself blocking on the first command's exit status to decide
+    // whether to also try the second one.
     for output in state.space.outputs() {
         let name = output.name();
-        // Try wlr-output-power-management first, fall back to xset/vbetool
         let _ = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!(
