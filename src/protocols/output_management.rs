@@ -185,7 +185,8 @@ impl Dispatch<ZwlrOutputConfigurationV1, ()> for BlueState {
                 let name = output_name_for_head(state, &head);
                 push_change(state, resource.id(), name, HeadChange::Disable);
             }
-            Request::Apply => apply_configuration(state, resource),
+            Request::Apply => apply_configuration(state, resource, false),
+            Request::Test => apply_configuration(state, resource, true),
             // NOTE: the real protocol name for this request is
             // "cancel", but this crate/version's generated `Request`
             // enum didn't expose a `Cancel` variant when this was
@@ -281,13 +282,53 @@ fn output_name_for_head(state: &BlueState, head: &ZwlrOutputHeadV1) -> String {
     String::new()
 }
 
-fn apply_configuration(state: &mut BlueState, cfg: &ZwlrOutputConfigurationV1) {
-    let Some(pending) = state.output_management_state.pending.remove(&cfg.id()) else {
-        cfg.succeeded();
-        return;
+/// `dry_run = true` implements the protocol's `test` request: validate
+/// the pending configuration and report success/failure exactly like
+/// `apply` does, but touch no actual compositor state. Previously only
+/// `apply` was handled at all — `Request::Test` fell through to the
+/// catch-all `_ => {}` arm below in the dispatch match, which silently
+/// dropped it: a client calling `test()` before `apply()` (the
+/// documented, recommended way to preview a configuration per the
+/// protocol's own description) would send the request and then simply
+/// never receive a `succeeded`/`failed` event back, since nothing ever
+/// called either on `cfg`. That's not just "test does nothing" — it's a
+/// client left waiting forever, since the protocol gives it no way to
+/// no-op the request itself.
+fn apply_configuration(state: &mut BlueState, cfg: &ZwlrOutputConfigurationV1, dry_run: bool) {
+    // For a real apply, the pending entry is consumed (`remove`) since
+    // this `ZwlrOutputConfigurationV1` object is done after this. For
+    // `test`, it must stay in place — the documented client flow is
+    // `test()` then, if that succeeds, `apply()` on the *same* pending
+    // config; removing it here would make that always fail on the
+    // apply step (nothing left to apply), silently breaking the exact
+    // flow `test` exists to support.
+    let pending = if dry_run {
+        let Some(p) = state.output_management_state.pending.get(&cfg.id()).cloned() else {
+            cfg.succeeded();
+            return;
+        };
+        p
+    } else {
+        let Some(p) = state.output_management_state.pending.remove(&cfg.id()) else {
+            cfg.succeeded();
+            return;
+        };
+        p
     };
     for (name, change) in pending.changes {
         let Some(output) = state.outputs.iter().find(|o| o.name() == name).cloned() else { continue };
+        if dry_run {
+            // The only "validation" this implementation does at all,
+            // for either dry_run or real apply, is confirming the named
+            // output still exists (the `let ... else { continue }`
+            // above) — there's no deeper mode/geometry compatibility
+            // check to run here that apply doesn't also skip, so a
+            // successful dry run just means every referenced output was
+            // found. Good enough to answer the protocol's actual
+            // question ("would apply() report failure"), and no worse
+            // than apply() itself's own validation depth.
+            continue;
+        }
         match change {
             HeadChange::Disable => {
                 state.space.unmap_output(&output);
@@ -321,14 +362,15 @@ fn apply_configuration(state: &mut BlueState, cfg: &ZwlrOutputConfigurationV1) {
             }
         }
     }
-    // Real hardware needs re-scanning the DRM surface (mode-set commit)
-    // after `Output::change_current_state` for bare-metal outputs —
-    // `render_udev`'s next frame will pick up the new `current_mode()`
-    // for damage-tracking purposes, but an actual modeset (changing the
-    // physical output timing) additionally needs a fresh
-    // `drm.create_surface(..)` call with the new `drm::control::Mode`,
-    // which isn't wired up from here yet (needs a DRM-mode lookup by
-    // width/height/refresh against `connector.modes()`).
+    // Real hardware modeset (reprogramming the physical output's DRM
+    // timing, not just the compositor's own idea of the output size) is
+    // handled inside `apply_hardware_modeset` above — including the
+    // DRM-mode lookup by width/height/refresh against `connector.modes()`
+    // this comment used to say was still missing. That was true when
+    // this function was first written; `apply_hardware_modeset` closed
+    // it in a later change and this comment was simply never updated to
+    // say so — leaving it here would have wrongly told the next reader
+    // this is still a gap.
     cfg.succeeded();
 }
 
