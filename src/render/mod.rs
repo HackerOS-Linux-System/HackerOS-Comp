@@ -41,7 +41,7 @@ use smithay::{
         // caused real version-conflict bugs earlier).
         drm::buffer::Buffer as DrmBufferTrait,
     },
-    utils::{DeviceFd, Point, Size, Transform},
+    utils::{DeviceFd, IsAlive, Point, Size, Transform},
 };
 use std::{collections::HashMap, os::unix::io::OwnedFd, time::Duration};
 use tracing::{error, info, warn};
@@ -171,6 +171,47 @@ pub fn render_winit(state: &mut BlueState, output: &Output) {
             &state.input_method_popups, renderer, output_scale as f64,
         ));
         elems.extend(layer_shell_elements(output, renderer, output_scale as f64));
+
+        // Cursor — winit (nested/dev) backend only, and only for the
+        // `CursorImageStatus::Surface` case (a client providing its own
+        // cursor image, e.g. a game with a custom crosshair). This
+        // deliberately mirrors Smithay's own anvil reference compositor's
+        // winit path exactly (anvil/src/winit.rs): for the common
+        // `Named`/system-cursor case, and for `Hidden`, we don't
+        // software-render anything at all — we just show/hide the host
+        // window's own native cursor a few lines below in Phase 2,
+        // since it's already correctly positioned by the host window
+        // system and drawing a second one on top would be redundant.
+        // Software-compositing a themed system cursor (XCursor loading,
+        // a persistent `MemoryRenderBuffer`) only matters for the
+        // udev/DRM backend, where there is no host window to borrow a
+        // cursor from — that's real, separate follow-up work, not
+        // attempted here (see `render_udev_gles`/`render_udev_pixman`,
+        // neither of which has any cursor handling yet either).
+        let cursor_status = state.cursor_status.lock().unwrap().clone();
+        if let smithay::input::pointer::CursorImageStatus::Surface(ref surface) = cursor_status {
+            if surface.alive() {
+                if let Some(pointer) = state.seat.get_pointer() {
+                    let hotspot = smithay::wayland::compositor::with_states(surface, |states| {
+                        states
+                            .data_map
+                            .get::<std::sync::Mutex<smithay::input::pointer::CursorImageAttributes>>()
+                            .map(|attrs| attrs.lock().unwrap().hotspot)
+                            .unwrap_or_default()
+                    });
+                    let scale = smithay::utils::Scale::from(output_scale as f64);
+                    let location = (pointer.current_location() - hotspot.to_f64())
+                        .to_physical(scale)
+                        .to_i32_round();
+                    let cursor_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                        smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
+                            renderer, surface, location, scale, 1.0,
+                            smithay::backend::renderer::element::Kind::Cursor,
+                        );
+                    elems.extend(cursor_elements.into_iter().map(Into::into));
+                }
+            }
+        }
         elems
     };
 
@@ -185,6 +226,24 @@ pub fn render_winit(state: &mut BlueState, output: &Output) {
     }
     drop(frame);
     if let Err(e) = d.backend.submit(None) { warn!("submit: {:?}", e); }
+    // Show/hide the host window's own native cursor — see the cursor
+    // block in Phase 1 above for why this (not a software-rendered
+    // system-cursor texture) is the right thing to do specifically for
+    // the nested/winit backend. Matches anvil/src/winit.rs's own
+    // `cursor_visible` logic exactly, including its one simplification:
+    // `Hidden` and `Named` are treated the same (host cursor shown) —
+    // only an explicit client `Surface` cursor hides it, since that's
+    // the case actually software-rendered above. A client that hides
+    // the cursor without providing its own replacement will still see
+    // the host arrow in nested/dev mode; this doesn't affect the real
+    // udev/DRM backend, which has no host cursor to hide in the first
+    // place.
+    let cursor_visible = !matches!(
+        *state.cursor_status.lock().unwrap(),
+        smithay::input::pointer::CursorImageStatus::Surface(_)
+    );
+    let BackendData::Winit(ref d) = state.backend_data else { return };
+    d.backend.window().set_cursor_visible(cursor_visible);
     d.backend.window().request_redraw();
 }
 
