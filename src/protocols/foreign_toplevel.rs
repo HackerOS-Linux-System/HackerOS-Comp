@@ -46,6 +46,13 @@ impl ForeignToplevelManagerState {
 }
 
 impl GlobalDispatch<ZwlrForeignToplevelManagerV1, ForeignToplevelManagerGlobalData> for BlueState {
+    fn can_view(client: Client, _global_data: &ForeignToplevelManagerGlobalData) -> bool {
+        // Enumerates every open window's title/app-id and lets the
+        // holder activate/minimize/close them — same trust boundary as
+        // screencopy.rs, see that file's can_view for the rationale.
+        crate::state::is_trusted_client(&client)
+    }
+
     fn bind(
         state: &mut Self,
         _handle: &DisplayHandle,
@@ -102,10 +109,19 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ToplevelHandleData> for BlueState {
             return;
         };
         match request {
-            Request::SetMaximized => { /* TODO: window.set_maximized via xdg/x11-specific path */ }
-            Request::UnsetMaximized => {}
-            Request::SetMinimized => {}
-            Request::UnsetMinimized => {}
+            Request::SetMaximized => {
+                let geo = state.primary_output_geometry();
+                state.maximize_window_by_id(data.window_id, true, geo);
+            }
+            Request::UnsetMaximized => {
+                state.maximize_window_by_id(data.window_id, false, None);
+            }
+            Request::SetMinimized => {
+                state.minimize_window_by_id(data.window_id);
+            }
+            Request::UnsetMinimized => {
+                state.unminimize_window_by_id(data.window_id);
+            }
             Request::Activate { seat: _ } => {
                 state.space.raise_element(&window, true);
                 if let Some(kb) = state.seat.get_keyboard() {
