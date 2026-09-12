@@ -61,6 +61,20 @@ impl BlueState {
                 self.is_locked = true;
                 self.broadcast_lock_state(true);
                 info!("session lock confirmed — all outputs covered");
+
+                // Keyboard focus is sticky in Smithay — it doesn't move
+                // on its own just because `is_locked` flipped. Without
+                // this, whatever window had focus the instant before
+                // locking would keep receiving keystrokes until the
+                // next pointer click/motion re-evaluates focus
+                // (input/mod.rs's `locked_focus` guard already covers
+                // that ongoing case, via update_pointer_focus/
+                // handle_pointer_button/surface_under_point — this
+                // covers the one-time transition those don't).
+                if let Some(keyboard) = self.seat.get_keyboard() {
+                    let target = self.lock_surfaces.values().next().map(|ls| ls.wl_surface().clone());
+                    keyboard.set_focus(self, target, smithay::utils::SERIAL_COUNTER.next_serial());
+                }
             }
         }
     }
