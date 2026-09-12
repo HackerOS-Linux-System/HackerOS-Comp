@@ -1,9 +1,12 @@
 use smithay::{
     backend::input::{
-        Axis, AxisSource, ButtonState, InputBackend, InputEvent,
+        Axis, AxisSource, ButtonState, Device, DeviceCapability, InputBackend, InputEvent,
         KeyState, KeyboardKeyEvent,
         PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
         PointerMotionAbsoluteEvent,
+        GestureSwipeBeginEvent, GestureSwipeUpdateEvent, GestureSwipeEndEvent,
+        ProximityState, TabletToolAxisEvent, TabletToolButtonEvent, TabletToolProximityEvent,
+        TabletToolTipEvent, TabletToolTipState,
         TouchDownEvent, TouchMotionEvent, TouchUpEvent, TouchCancelEvent,
     },
     desktop::WindowSurfaceType,
@@ -17,8 +20,9 @@ use smithay::{
         touch::{DownEvent as TouchDownData, MotionEvent as TouchMotionData, UpEvent as TouchUpData},
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
-    utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER},
+    utils::{IsAlive, Logical, Point, Rectangle, Size, SERIAL_COUNTER},
     wayland::seat::WaylandFocus,
+    wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait},
 };
 
 pub mod keybind;
@@ -47,6 +51,48 @@ pub fn handle_input<B: InputBackend>(state: &mut BlueState, event: InputEvent<B>
         InputEvent::TouchFrame { .. } => {
             if let Some(touch) = state.seat.get_touch() {
                 touch.frame(state);
+            }
+        }
+        // Tablet/stylus — `zwp_tablet_manager_v2` has been registered
+        // since early in this project (TabletManagerState in
+        // state/mod.rs) but, until now, nothing forwarded actual
+        // proximity/motion/tip/button events to it — a real graphics
+        // tablet's globals were visible to clients but every event from
+        // it silently vanished here. Modeled directly on Smithay's own
+        // anvil reference compositor (anvil/src/input_handler.rs's
+        // on_tablet_tool_*), adapted to this project's existing
+        // absolute-position/focus helpers instead of duplicating them.
+        InputEvent::TabletToolAxis { event } => handle_tablet_axis(state, &event),
+        InputEvent::TabletToolProximity { event } => handle_tablet_proximity(state, &event),
+        InputEvent::TabletToolTip { event } => handle_tablet_tip(state, &event),
+        InputEvent::TabletToolButton { event } => handle_tablet_button(state, &event),
+        // 3/4-finger touchpad swipe → workspace switch. See
+        // handle_gesture_swipe_end's doc for the direction convention
+        // and why 1/2-finger swipes (ordinary scroll/pointer gestures,
+        // reported through this same libinput event stream) are
+        // deliberately ignored rather than also switching workspaces.
+        InputEvent::GestureSwipeBegin { event } => handle_gesture_swipe_begin(state, &event),
+        InputEvent::GestureSwipeUpdate { event } => handle_gesture_swipe_update(state, &event),
+        InputEvent::GestureSwipeEnd { event } => handle_gesture_swipe_end(state, &event),
+        InputEvent::DeviceAdded { device } => {
+            if device.has_capability(DeviceCapability::TabletTool) {
+                state
+                    .seat
+                    .tablet_seat()
+                    .add_tablet::<BlueState>(&state.display_handle, &TabletDescriptor::from(&device));
+            }
+        }
+        InputEvent::DeviceRemoved { device } => {
+            if device.has_capability(DeviceCapability::TabletTool) {
+                let tablet_seat = state.seat.tablet_seat();
+                tablet_seat.remove_tablet(&TabletDescriptor::from(&device));
+                // No tablets left on the seat — drop tools too, rather
+                // than leaving stale tool objects a client could still
+                // query state from after the last physical tablet was
+                // unplugged.
+                if tablet_seat.count_tablets() == 0 {
+                    tablet_seat.clear_tools();
+                }
             }
         }
         _ => {}
@@ -454,18 +500,50 @@ pub(crate) fn output_bounds(state: &BlueState) -> (f64, f64, f64, f64) {
         .unwrap_or((0.0, 0.0, 1920.0, 1080.0))
 }
 
+/// When the session is locked, keyboard/pointer/touch focus must go to
+/// the lock surface for whatever output the input is on — never to a
+/// regular window underneath it. Without this, `session-lock`'s
+/// protocol handshake (protocols/session_lock.rs) is purely decorative:
+/// a client can `lock()` and get `is_locked = true`, but a click or
+/// keypress would still reach whatever window is under the pointer,
+/// same as if nothing were locked at all. This is the security-audit
+/// finding this closes — see the compositor security notes' "prawdziwy
+/// ekran blokady" section for the fuller writeup.
+///
+/// Returns `None` (falls through to normal hit-testing) when not
+/// locked, or when locked but no lock surface has been created yet for
+/// the relevant output (e.g. the brief window between `lock()` being
+/// granted and the lock client actually mapping its per-output
+/// surfaces) — input is simply dropped on the floor in that gap rather
+/// than reaching an unintended window, which is the safe direction to
+/// fail in.
+fn locked_focus(state: &BlueState, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+    if !state.is_locked {
+        return None;
+    }
+    let output = state.space.output_under(pos).next()?;
+    let lock_surface = state.lock_surfaces.get(&output.name())?;
+    if !lock_surface.alive() {
+        return None;
+    }
+    let output_loc = state.space.output_geometry(output)?.loc.to_f64();
+    Some((lock_surface.wl_surface().clone(), output_loc))
+}
+
 pub(crate) fn update_pointer_focus(state: &mut BlueState, serial: smithay::utils::Serial, time: u32) {
     let pointer = state.seat.get_pointer().unwrap();
     let pos = state.pointer_location;
 
-    let focus: Option<(WlSurface, Point<f64, Logical>)> = state
-        .space
-        .element_under(pos)
-        .and_then(|(win, win_loc)| {
-            let rel = pos - win_loc.to_f64();
-            win.surface_under(rel, WindowSurfaceType::ALL)
-                .map(|(s, sp)| (s, (win_loc + sp).to_f64()))
-        });
+    let focus: Option<(WlSurface, Point<f64, Logical>)> = locked_focus(state, pos).or_else(|| {
+        state
+            .space
+            .element_under(pos)
+            .and_then(|(win, win_loc)| {
+                let rel = pos - win_loc.to_f64();
+                win.surface_under(rel, WindowSurfaceType::ALL)
+                    .map(|(s, sp)| (s, (win_loc + sp).to_f64()))
+            })
+    });
 
     pointer.motion(
         state,
@@ -489,12 +567,22 @@ fn handle_pointer_button<B: InputBackend, E: PointerButtonEvent<B>>(
     let pos = state.pointer_location;
 
     if event.state() == ButtonState::Pressed {
-        let maybe_window = state
-            .space
-            .element_under(pos)
-            .map(|(w, _)| w.clone());
-
-        if let Some(window) = maybe_window {
+        if state.is_locked {
+            // While locked, a click must never raise/focus a regular
+            // window — only ever (re-)confirm focus on the lock
+            // surface, so a keypress right after this click still goes
+            // there too (keyboard focus and pointer focus are set
+            // independently in Smithay; without this, clicking during
+            // a locked session — even though update_pointer_focus above
+            // already keeps *pointer* focus on the lock surface — could
+            // still leave stale *keyboard* focus on whatever window had
+            // it before locking).
+            let keyboard = state.seat.get_keyboard().unwrap();
+            match locked_focus(state, pos) {
+                Some((surface, _)) => keyboard.set_focus(state, Some(surface), serial),
+                None => keyboard.set_focus(state, Option::<WlSurface>::None, serial),
+            }
+        } else if let Some(window) = state.space.element_under(pos).map(|(w, _)| w.clone()) {
             state.space.raise_element(&window, true);
             let keyboard = state.seat.get_keyboard().unwrap();
             if let Some(surface) = window.wl_surface() {
@@ -938,14 +1026,16 @@ pub fn start_resize_grab(
 /// pointer, factored out so touch-down can reuse it without duplicating
 /// the `space.element_under` + `surface_under` dance.
 fn surface_under_point(state: &BlueState, pos: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
-    state
-        .space
-        .element_under(pos)
-        .and_then(|(win, win_loc)| {
-            let rel = pos - win_loc.to_f64();
-            win.surface_under(rel, WindowSurfaceType::ALL)
-                .map(|(s, sp)| (s, (win_loc + sp).to_f64()))
-        })
+    locked_focus(state, pos).or_else(|| {
+        state
+            .space
+            .element_under(pos)
+            .and_then(|(win, win_loc)| {
+                let rel = pos - win_loc.to_f64();
+                win.surface_under(rel, WindowSurfaceType::ALL)
+                    .map(|(s, sp)| (s, (win_loc + sp).to_f64()))
+            })
+    })
 }
 
 /// Touch is inherently absolute (a touchscreen's coordinate space maps
@@ -1022,6 +1112,164 @@ fn handle_touch_up<B: InputBackend, E: TouchUpEvent<B>>(state: &mut BlueState, e
 fn handle_touch_cancel<B: InputBackend, E: TouchCancelEvent<B>>(state: &mut BlueState, _event: &E) {
     let Some(touch) = state.seat.get_touch() else { return };
     touch.cancel(state);
+}
+
+// ── Tablet ────────────────────────────────────────────────────────────────
+//
+// See the `InputEvent::TabletTool*`/`DeviceAdded`/`DeviceRemoved` match
+// arms in `handle_input` above for the registration side of this. All
+// four handlers below move the regular pointer too (not just the
+// tablet tool) — most tablets are used as an absolute-position mouse
+// substitute as much as a pressure-sensitive pen, so the on-screen
+// cursor should track the stylus the same way it tracks a touchscreen
+// tap, in addition to the tool-specific axis data going to whichever
+// client actually asked for `zwp_tablet_manager_v2`.
+
+fn handle_tablet_axis<B: InputBackend, E: TabletToolAxisEvent<B>>(state: &mut BlueState, event: &E) {
+    let size = output_size_for_touch(state);
+    let pos = event.position_transformed(size);
+    state.pointer_location = pos;
+    let serial = SERIAL_COUNTER.next_serial();
+    update_pointer_focus(state, serial, event.time_msec());
+
+    let tablet_seat = state.seat.tablet_seat();
+    let tablet = tablet_seat.get_tablet(&TabletDescriptor::from(&event.device()));
+    let tool = tablet_seat.get_tool(&event.tool());
+    let Some((tablet, tool)) = tablet.zip(tool) else { return };
+
+    if event.pressure_has_changed() { tool.pressure(event.pressure()); }
+    if event.distance_has_changed() { tool.distance(event.distance()); }
+    if event.tilt_has_changed() { tool.tilt(event.tilt()); }
+    if event.slider_has_changed() { tool.slider_position(event.slider_position()); }
+    if event.rotation_has_changed() { tool.rotation(event.rotation()); }
+    if event.wheel_has_changed() { tool.wheel(event.wheel_delta(), event.wheel_delta_discrete()); }
+
+    let under = surface_under_point(state, pos);
+    tool.motion(pos, under, &tablet, SERIAL_COUNTER.next_serial(), event.time_msec());
+}
+
+fn handle_tablet_proximity<B: InputBackend, E: TabletToolProximityEvent<B>>(state: &mut BlueState, event: &E) {
+    let size = output_size_for_touch(state);
+    let pos = event.position_transformed(size);
+    state.pointer_location = pos;
+    let serial = SERIAL_COUNTER.next_serial();
+    update_pointer_focus(state, serial, event.time_msec());
+
+    let tool_desc = event.tool();
+    // Registers the tool with the seat the first time it's seen (a
+    // no-op if it's already known) — must happen before `get_tool`
+    // below, which only looks up tools that were already added.
+    // Split into separate statements (rather than one chained
+    // `state.seat.tablet_seat().add_tool(state, ...)` expression) so
+    // there's no ambiguity about the transient immutable borrow from
+    // `.tablet_seat()` having ended before `state` is borrowed
+    // mutably for `add_tool` itself.
+    let tablet_seat = state.seat.tablet_seat();
+    let dh = state.display_handle.clone();
+    tablet_seat.add_tool::<BlueState>(state, &dh, &tool_desc);
+
+    let tablet_seat = state.seat.tablet_seat();
+    let tablet = tablet_seat.get_tablet(&TabletDescriptor::from(&event.device()));
+    let tool = tablet_seat.get_tool(&tool_desc);
+    let under = surface_under_point(state, pos);
+    let Some(((tablet, tool), under)) = tablet.zip(tool).zip(under) else { return };
+
+    match event.state() {
+        ProximityState::In => {
+            tool.proximity_in(pos, under, &tablet, SERIAL_COUNTER.next_serial(), event.time_msec());
+        }
+        ProximityState::Out => tool.proximity_out(event.time_msec()),
+    }
+}
+
+fn handle_tablet_tip<B: InputBackend, E: TabletToolTipEvent<B>>(state: &mut BlueState, event: &E) {
+    let Some(tool) = state.seat.tablet_seat().get_tool(&event.tool()) else { return };
+    match event.tip_state() {
+        TabletToolTipState::Down => {
+            let serial = SERIAL_COUNTER.next_serial();
+            tool.tip_down(serial, event.time_msec());
+            // A tip-down is a "click" for focus purposes — same
+            // keyboard-focus-follows-click behavior as
+            // handle_pointer_button, including respecting a locked
+            // session via `locked_focus` (a stylus tap during
+            // session-lock must not be able to focus/type into a
+            // regular window any more than a mouse click can).
+            let keyboard = state.seat.get_keyboard().unwrap();
+            match locked_focus(state, state.pointer_location) {
+                Some((surface, _)) => keyboard.set_focus(state, Some(surface), serial),
+                None => {
+                    if let Some((surface, _)) = surface_under_point(state, state.pointer_location) {
+                        keyboard.set_focus(state, Some(surface), serial);
+                    }
+                }
+            }
+        }
+        TabletToolTipState::Up => tool.tip_up(event.time_msec()),
+    }
+}
+
+fn handle_tablet_button<B: InputBackend, E: TabletToolButtonEvent<B>>(state: &mut BlueState, event: &E) {
+    let Some(tool) = state.seat.tablet_seat().get_tool(&event.tool()) else { return };
+    tool.button(event.button(), event.button_state(), SERIAL_COUNTER.next_serial(), event.time_msec());
+}
+
+// ── Touchpad gestures ────────────────────────────────────────────────────
+//
+// A 3-or-4-finger horizontal swipe switches workspace. This didn't
+// exist anywhere in the compositor before — `handle_input`'s match had
+// no `InputEvent::Gesture*` arms at all, despite an earlier pass of
+// documentation (now corrected) describing swipe-based workspace
+// switching as already working. `Action`/keybinding-style indirection
+// (as a config.rs enum a gesture could also target) is intentionally
+// not introduced here — `switch_workspace` is the one thing every
+// existing workspace-switch entry point already calls directly (IPC
+// from the shell, ext-workspace protocol clients), so this follows the
+// same pattern rather than inventing a second, gesture-only path to the
+// same effect.
+
+/// Total accumulated horizontal movement (logical pixels) a 3/4-finger
+/// swipe must cross before it counts as a workspace switch rather than
+/// an aborted/too-small gesture. Deliberately generous compared to a
+/// typical single-finger-scroll threshold — this is a full-screen
+/// gesture users perform somewhat quickly, not a fine pointing motion.
+const WORKSPACE_SWIPE_THRESHOLD: f64 = 80.0;
+
+fn handle_gesture_swipe_begin<B: InputBackend, E: GestureSwipeBeginEvent<B>>(state: &mut BlueState, event: &E) {
+    // 1/2-finger "swipes" are libinput's term for ordinary scrolling/
+    // pointer gestures on some drivers and arrive through this same
+    // event stream — only 3+ fingers is an intentional, deliberate
+    // "switch workspace" gesture on virtually every desktop environment
+    // convention (GNOME, KDE, macOS all reserve 2-finger for scroll).
+    state.workspace_swipe = (event.fingers() >= 3).then_some(0.0);
+}
+
+fn handle_gesture_swipe_update<B: InputBackend, E: GestureSwipeUpdateEvent<B>>(state: &mut BlueState, event: &E) {
+    if let Some(delta) = state.workspace_swipe.as_mut() {
+        *delta += event.delta_x();
+    }
+}
+
+/// Direction convention: swiping left (negative accumulated delta, ~
+/// "content moves left, like flipping to the next page") switches to
+/// the *next* workspace; swiping right goes to the *previous* one. This
+/// matches GNOME's default touchpad convention, which is what most
+/// libinput-based distros' users will already have muscle memory for.
+fn handle_gesture_swipe_end<B: InputBackend, E: GestureSwipeEndEvent<B>>(state: &mut BlueState, event: &E) {
+    let Some(delta) = state.workspace_swipe.take() else { return };
+    if event.cancelled() || delta.abs() < WORKSPACE_SWIPE_THRESHOLD {
+        return;
+    }
+    let count = state.workspace_count;
+    if count == 0 {
+        return;
+    }
+    let current = state.current_workspace;
+    let next = if delta < 0.0 {
+        (current + 1) % count
+    } else {
+        (current + count - 1) % count
+    };
+    state.switch_workspace(next);
 }
 
 #[cfg(test)]
