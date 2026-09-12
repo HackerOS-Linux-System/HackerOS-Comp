@@ -75,6 +75,13 @@ pub fn notify_workspace_switched(state: &mut BlueState, old_index: usize, new_in
 }
 
 impl GlobalDispatch<ExtWorkspaceManagerV1, ()> for BlueState {
+    fn can_view(client: Client, _global_data: &()) -> bool {
+        // Workspace listing/switching — same trust boundary as
+        // screencopy.rs/foreign_toplevel.rs, see screencopy.rs's
+        // can_view for the rationale.
+        crate::state::is_trusted_client(&client)
+    }
+
     fn bind(
         state: &mut Self,
         handle: &DisplayHandle,
