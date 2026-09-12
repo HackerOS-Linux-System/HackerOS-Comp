@@ -7,6 +7,7 @@ use smithay::{
     delegate_viewporter, delegate_xdg_shell,
     delegate_pointer_constraints, delegate_relative_pointer,
     delegate_tablet_manager, delegate_text_input_manager, delegate_input_method_manager,
+    delegate_virtual_keyboard_manager,
     desktop::{layer_map_for_output, PopupManager, Space, Window},
     input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
     output::Output,
@@ -53,6 +54,7 @@ use smithay::{
         tablet_manager::TabletManagerState,
         text_input::TextInputManagerState,
         input_method::{InputMethodHandler, InputMethodManagerState},
+        virtual_keyboard::VirtualKeyboardManagerState,
     },
     input::dnd::DndGrabHandler,
     xwayland::{XWayland, xwm::X11Wm},
@@ -139,11 +141,93 @@ pub struct WindowInfo {
 #[derive(Default)]
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
+    /// Whether this client's connecting process was recognized as part
+    /// of the compositor's own trusted shell (see [`client_is_trusted`]
+    /// and the security-audit notes on `can_view` gating for
+    /// screencopy/foreign-toplevel/ext-workspace). Decided once, at
+    /// accept time, from the Unix socket's peer credentials — never
+    /// changes for the lifetime of the connection.
+    pub trusted: bool,
 }
 
 impl ClientData for ClientState {
     fn initialized(&self, _: ClientId) {}
     fn disconnected(&self, _: ClientId, _: DisconnectReason) {}
+}
+
+/// Executable basenames allowed to bind privileged globals (screen
+/// capture, window/workspace enumeration and control) without an
+/// explicit per-request user prompt. This is a stopgap, not the
+/// long-term design: it trusts *any* process running one of these
+/// binaries, with no revocation and no per-action consent. The correct
+/// long-term replacement is a real permission prompt (mirroring
+/// xdg-desktop-portal's model) shown by the shell the first time an
+/// unrecognized client asks for one of these globals, with the answer
+/// remembered — see the security-audit notes for why this order
+/// (allowlist now, prompt later) rather than shipping with no gate at
+/// all in the meantime.
+const TRUSTED_CLIENT_BASENAMES: &[&str] = &["blue-environment", "sde-panel", "sde-dock"];
+
+/// Determines trust for a newly-accepted Wayland client from the peer
+/// process identity of its Unix socket connection, *before* the client
+/// has sent a single protocol message. Resolves the peer PID's `/proc`
+/// symlink rather than trusting anything the client could itself claim,
+/// since nothing about a Unix stream socket's `SO_PEERCRED`-style
+/// credentials can be spoofed by the connecting process — the kernel
+/// fills them in.
+///
+/// Implemented as a raw `getsockopt(SO_PEERCRED)` via `libc` rather than
+/// `std::os::unix::net::UnixStream::peer_cred()` — that method is still
+/// gated behind the unstable `peer_credentials_unix_socket` feature on
+/// this toolchain (confirmed by a real build: `error[E0658]: use of
+/// unstable library feature`), so it isn't usable on stable Rust today
+/// despite several older write-ups describing it as already stabilized.
+/// `getsockopt`/`SO_PEERCRED` themselves are plain, long-stable Linux
+/// syscalls with no such gate.
+///
+/// Fails safe: any error resolving credentials or the executable path
+/// (permission denied, process already gone, non-Linux `/proc` absent)
+/// results in `false`, not `true`.
+fn client_is_trusted(stream: &std::os::unix::net::UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = stream.as_raw_fd();
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `fd` is a valid, open socket for the lifetime of this
+    // call (borrowed from `stream`, which outlives this function call).
+    // `cred`/`len` are valid, appropriately-sized out-parameters for
+    // `SO_PEERCRED` on Linux, matching `getsockopt`'s documented
+    // contract exactly.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret != 0 {
+        return false; // getsockopt failed — fail closed, not open
+    }
+
+    let pid = cred.pid;
+    let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else { return false };
+    let Some(basename) = exe.file_name().and_then(|n| n.to_str()) else { return false };
+    TRUSTED_CLIENT_BASENAMES.contains(&basename)
+}
+
+/// Reads back the trust decision made in [`client_is_trusted`] at
+/// accept time, for use in `GlobalDispatch::can_view` implementations
+/// that only have access to a `Client` handle (no `DisplayHandle`, no
+/// `&BlueState`) — see `protocols/screencopy.rs`,
+/// `protocols/foreign_toplevel.rs`, and `protocols/ext_workspace.rs`.
+pub fn is_trusted_client(client: &smithay::reexports::wayland_server::Client) -> bool {
+    client
+        .get_data::<ClientState>()
+        .map(|data| data.trusted)
+        .unwrap_or(false)
 }
 
 // ── Backend data ───────────────────────────────────────────────────────────
@@ -443,6 +527,13 @@ pub struct BlueState {
     pub space: Space<Window>,
     pub popup_manager: PopupManager,
     pub current_workspace: usize,
+    /// Accumulated horizontal delta for an in-progress 3/4-finger
+    /// touchpad swipe, reset on `GestureSwipeBegin` and consumed on
+    /// `GestureSwipeEnd` — see input/mod.rs's gesture handlers. `None`
+    /// when no swipe is in progress (also used to ignore 1/2-finger
+    /// swipes, which libinput reports through the same event stream
+    /// but which are reserved for normal scrolling elsewhere).
+    pub workspace_swipe: Option<f64>,
     pub workspace_count: usize,
 
     // Wayland protocol states
@@ -478,6 +569,22 @@ pub struct BlueState {
     /// lets an actual input-method client (e.g. a CJK IME, an on-screen
     /// keyboard) attach to the seat and drive text-input clients.
     pub input_method_manager_state: InputMethodManagerState,
+    /// `zwp_virtual_keyboard_manager_v1` — raw key-event injection (as
+    /// opposed to `input_method_manager_state` above, which is for IME
+    /// composition/candidate windows). This is what a simple on-screen
+    /// QWERTY keyboard actually wants: synthesize a keycode, have it
+    /// arrive at whatever surface has keyboard focus exactly like a
+    /// real hardware key press would. Gated by `client_is_trusted`, not
+    /// `|_client| true` like session-lock/input-method above — unlike
+    /// those two, a virtual keyboard client can synthesize *arbitrary*
+    /// keystrokes into whatever's focused, so an untrusted client
+    /// holding this global is a real keystroke-injection risk, not just
+    /// unwanted access to a narrow-purpose feature. See
+    /// `client_is_trusted`'s doc and the security-audit notes this
+    /// closes out (previously this protocol didn't exist in the
+    /// compositor at all — see the "grupa A" client-trust-model
+    /// findings).
+    pub virtual_keyboard_manager_state: VirtualKeyboardManagerState,
     /// Live IME candidate-window popups — see protocols/input_method.rs.
     /// Previously `new_popup`/`dismiss_popup` were empty stubs, so an
     /// IME's popup surface existed on the wire but was never tracked or
@@ -708,6 +815,11 @@ impl BlueState {
         let tablet_manager_state = TabletManagerState::new::<Self>(&display_handle);
         let text_input_manager_state = TextInputManagerState::new::<Self>(&display_handle);
         let input_method_manager_state = InputMethodManagerState::new::<Self, _>(&display_handle, |_client| true);
+        // Unlike session-lock/input-method above, this one uses the
+        // real trust filter, not `|_client| true` — see the field's doc
+        // comment on BlueState for why raw key-event injection needs a
+        // narrower gate than those two.
+        let virtual_keyboard_manager_state = VirtualKeyboardManagerState::new::<Self, _>(&display_handle, is_trusted_client);
         let foreign_toplevel_state = crate::protocols::foreign_toplevel::ForeignToplevelManagerState::new(&display_handle);
         let output_management_state = crate::protocols::output_management::OutputManagementState::new(&display_handle);
         let screencopy_state = crate::protocols::screencopy::ScreencopyState::new(&display_handle);
@@ -723,9 +835,15 @@ impl BlueState {
 
         loop_handle
             .insert_source(socket, |client, _, state: &mut BlueState| {
+                // Decide trust from the raw accepted UnixStream's peer
+                // credentials *before* wrapping it in a Wayland client —
+                // see client_is_trusted's doc for why this can't be
+                // deferred to later (can_view only gets a `Client`, not
+                // the stream).
+                let trusted = client_is_trusted(&client);
                 if let Err(e) = state
                     .display_handle
-                    .insert_client(client, Arc::new(ClientState::default()))
+                    .insert_client(client, Arc::new(ClientState { trusted, ..Default::default() }))
                 {
                     warn!("Failed to insert client: {}", e);
                 }
@@ -754,6 +872,7 @@ impl BlueState {
             space: Space::default(),
             popup_manager: PopupManager::default(),
             current_workspace: 0,
+            workspace_swipe: None,
             workspace_count,
             compositor_state,
             xdg_shell_state,
@@ -774,6 +893,7 @@ impl BlueState {
             tablet_manager_state,
             text_input_manager_state,
             input_method_manager_state,
+            virtual_keyboard_manager_state,
             input_method_popups: Vec::new(),
             dmabuf_state: None,
             single_pixel_buffer_state,
@@ -1750,6 +1870,7 @@ impl InputMethodHandler for BlueState {
     }
 }
 delegate_input_method_manager!(BlueState);
+delegate_virtual_keyboard_manager!(BlueState);
 
 delegate_compositor!(BlueState);
 delegate_shm!(BlueState);
