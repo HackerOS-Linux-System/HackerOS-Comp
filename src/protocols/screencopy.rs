@@ -54,6 +54,16 @@ impl ScreencopyState {
 }
 
 impl GlobalDispatch<ZwlrScreencopyManagerV1, ScreencopyGlobalData> for BlueState {
+    fn can_view(client: Client, _global_data: &ScreencopyGlobalData) -> bool {
+        // Screen capture exposes the entire contents of every output to
+        // whoever holds this global — gate it to the compositor's own
+        // trusted shell processes until a real per-request consent
+        // prompt exists. See state::client_is_trusted's doc for the
+        // rationale and TRUSTED_CLIENT_BASENAMES for the current
+        // allowlist.
+        crate::state::is_trusted_client(&client)
+    }
+
     fn bind(
         _state: &mut Self,
         _handle: &DisplayHandle,
